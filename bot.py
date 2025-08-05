@@ -59,7 +59,6 @@ async def on_message(message):
             role = discord.utils.get(message.guild.roles, name=roles[ind])
             await message.channel.send(role.mention)
             pins = await message.channel.pins()
-            print(len(pins))
             if (len(pins) > 48):
                await  pins[-1].unpin()
             await message.pin(reason=None)
@@ -79,3 +78,4 @@ async def on_ready():
 
 
 bot.run(os.getenv('discord_token'))
+
