@@ -54,7 +54,7 @@ async def on_message(message):
 
     if (message.attachments and (str(message.channel.id) in channels)):
         s = message.attachments[0].url
-        if ((s.split("?")[0].endswith('epub')or s.split("?")[0].endswith('txt') or s.split("?")[0].endswith('TXT') or s.split("?")[0].endswith('EPUB') or s.split("?")[0].endswith('docx') or s.split("?")[0].endswith('DOCX') or s.split("?")[0].endswith('pdf') or s.split("?")[0].endswith('PDF'))):
+        if s.split("?")[0].lower().endswith(('.epub', '.txt', '.docx', '.pdf')):
             ind = channels.index(str(message.channel.id))
             role = discord.utils.get(message.guild.roles, name=roles[ind])
             await message.channel.send(role.mention)
