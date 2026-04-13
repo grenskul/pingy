@@ -14,7 +14,7 @@ CONFIG_CHANNELS = "/config/channels.json"
 # Absolute path to the legacy roles config (list of role names, parallel to channels)
 CONFIG_ROLES = "/config/roles.json"
 # Fallback channel ID used only on the very first run before the DB has a ui_channel_id entry
-ROLE_UI_CHANNEL = os.getenv('roles_channel')
+ROLE_UI_CHANNEL = int(os.getenv('roles_channel'))
 # The emoji users react with to subscribe/unsubscribe from a role
 ROLE_EMOJI = "✅"
 # Path to the flag file written when legacy import fails, signals a fresh DB is needed
