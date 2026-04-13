@@ -1,66 +1,773 @@
-import discord
-from discord.ext import commands
-import json
-import re
-import asyncio
-import os
+import discord                          # Main discord.py library for interacting with the Discord API
+from discord.ext import commands, tasks # commands: prefix command framework; tasks: loop scheduler
+from discord import app_commands        # Slash command support
+import aiosqlite                        # Async SQLite driver — lets us query the DB without blocking the event loop
+import json                             # Used to parse legacy config files (channels.json, roles.json)
+import os                               # Used to check if files exist before reading them
+import asyncio                          # Needed to run the async main() entry point
+import datetime                         # Used to generate timestamps in log messages
 
-Intents = discord.Intents.all()
+# Absolute path to the SQLite database file
+DB_PATH = "/config/bot.db"
+# Absolute path to the legacy channels config (list of channel IDs)
+CONFIG_CHANNELS = "/config/channels.json"
+# Absolute path to the legacy roles config (list of role names, parallel to channels)
+CONFIG_ROLES = "/config/roles.json"
+# Fallback channel ID used only on the very first run before the DB has a ui_channel_id entry
+ROLE_UI_CHANNEL = os.getenv('roles_channel')
+# The emoji users react with to subscribe/unsubscribe from a role
+ROLE_EMOJI = "✅"
+# Path to the flag file written when legacy import fails, signals a fresh DB is needed
+DB_FAIL_FILE = "/config/newDB"
 
-channels = []
-roles = []
+# Enable all gateway intents so the bot receives full member, message, and reaction events
+intents = discord.Intents.all()
+# Create the bot instance with '!' as the prefix for legacy prefix commands
+bot = commands.Bot(command_prefix='!', description="This is a Fic notification Bot", intents=intents)
+# Global DB connection handle, assigned in init_db() before the bot starts
+db: aiosqlite.Connection = None
 
-def read (filename):
-   try:
-        with open(filename, 'r') as json_file:
-            return json.loads(json_file.read())
-   except FileNotFoundError:
-        return []
 
-def write(filename , save_object):
-    with open(filename, 'w') as json_file:
-        json_file.write(json.dumps(save_object))
+def log(msg: str):
+    # Format current time as a readable timestamp
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Print with flush=True so output appears immediately even when piped or redirected
+    print(f"[{timestamp}] {msg}", flush=True)
 
-channels = read('/config/channels.json')#.get('channels', None)
-if channels is None:
-    channels = []
-	
-roles = read('/config/roles.json')#.get('roles', None)
-if roles is None:
-    roles = []
-	
-bot = commands.Bot(command_prefix='!', description="This is a Fic notification Bot",intents=Intents)
+
+async def write_newdb_flag(reason: str):
+    # Write a plaintext flag file explaining why the legacy import failed
+    try:
+        with open(DB_FAIL_FILE, "w") as f:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Record timestamp and reason so the operator knows what went wrong
+            f.write(f"{timestamp} — Legacy import failed: {reason}\n")
+        log(f"Created newDB due to legacy import failure: {reason}")
+    except Exception as e:
+        # Don't crash if we can't even write the flag file — just log it
+        log(f"Failed to write newDB flag file: {e}")
+
+
+async def init_db():
+    global db
+    # Open (or create) the SQLite database at DB_PATH; connection is kept open for the bot's lifetime
+    db = await aiosqlite.connect(DB_PATH)
+
+    # roles: one row per named role; name must be unique
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS roles (
+        id   INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )
+    ''')
+
+    # user_roles: many-to-many mapping of Discord user IDs to internal role IDs
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS user_roles (
+        user_id INTEGER,
+        role_id INTEGER,
+        PRIMARY KEY (user_id, role_id)
+    )
+    ''')
+
+    # channel_roles: many-to-many mapping of Discord channel IDs to internal role IDs
+    # a role can be linked to multiple channels; a channel can have multiple roles
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS channel_roles (
+        channel_id INTEGER,
+        role_id    INTEGER,
+        PRIMARY KEY (channel_id, role_id)
+    )
+    ''')
+
+    # role_ui_messages: tracks which Discord message ID corresponds to each role's UI entry
+    # used to map incoming reactions back to the correct role
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS role_ui_messages (
+        role_id    INTEGER PRIMARY KEY,
+        message_id INTEGER
+    )
+    ''')
+
+    # settings: generic key-value store; currently holds 'ui_channel_id'
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+
+    # Persist all schema changes
+    await db.commit()
+    log("Database initialized.")
+
+
+async def get_ui_channel_id():
+    # Query the settings table for the current UI channel ID
+    async with db.execute("SELECT value FROM settings WHERE key='ui_channel_id'") as cur:
+        row = await cur.fetchone()
+
+    # If found, cast from stored string to int and return
+    if row:
+        return int(row[0])
+
+    # First run: no entry exists yet — seed it with the hardcoded fallback constant
+    initial_id = ROLE_UI_CHANNEL
+
+    # Write the initial value into the DB so future calls read from there instead of the constant
+    await db.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES('ui_channel_id', ?)",
+        (str(initial_id),)
+    )
+    await db.commit()
+
+    return initial_id
+
+
+async def import_legacy():
+    # Wrap everything in try/except so any unexpected error is caught and flagged
+    try:
+        # Both config files must exist; if either is missing, bail out
+        if not os.path.exists(CONFIG_CHANNELS) or not os.path.exists(CONFIG_ROLES):
+            log("Legacy import failed: missing config files.")
+            await write_newdb_flag("Missing config files")
+            return
+
+        try:
+            # Parse channels.json — expected to be a JSON array of channel ID strings
+            with open(CONFIG_CHANNELS) as f:
+                channels = json.load(f)
+            # Parse roles.json — expected to be a JSON array of role name strings
+            with open(CONFIG_ROLES) as f:
+                roles = json.load(f)
+        except Exception as e:
+            log(f"Legacy import failed: JSON parse error: {e}")
+            await write_newdb_flag(f"JSON read/parse error: {e}")
+            return
+
+        # Both files must be JSON arrays, not objects or primitives
+        if not isinstance(channels, list) or not isinstance(roles, list):
+            log("Legacy import failed: config files not JSON arrays.")
+            await write_newdb_flag("Config files are not JSON arrays")
+            return
+
+        # Neither file can be empty
+        if len(channels) == 0 or len(roles) == 0:
+            log("Legacy import failed: config files empty.")
+            await write_newdb_flag("Config files are empty")
+            return
+
+        # The two lists must be the same length so they can be zipped 1:1
+        if len(channels) != len(roles):
+            log("Legacy import failed: mismatched list lengths.")
+            await write_newdb_flag("Config file lengths do not match")
+            return
+
+        # Iterate paired (channel_id, role_name) entries from the legacy config
+        for ch, role_name in zip(channels, roles):
+            # Insert the role name if it doesn't already exist
+            await db.execute("INSERT OR IGNORE INTO roles(name) VALUES(?)", (role_name,))
+            # Retrieve the auto-assigned role ID (needed for the channel_roles link)
+            async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
+                row = await cur.fetchone()
+            role_id = row[0]
+
+            # Link this role to its corresponding channel
+            await db.execute(
+                "INSERT OR IGNORE INTO channel_roles(channel_id, role_id) VALUES(?, ?)",
+                (int(ch), role_id)
+            )
+
+        await db.commit()
+        log("Legacy config imported successfully.")
+
+    except Exception as e:
+        log(f"Legacy import failed with unexpected exception: {e}")
+        await write_newdb_flag(f"Unexpected exception: {e}")
+
+
+async def get_role_id(role_name):
+    # Look up the internal role ID by name; returns None if the role doesn't exist
+    async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def get_users_for_role(role_id):
+    # Return a list of Discord user IDs subscribed to the given internal role ID
+    async with db.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)) as cur:
+        return [r[0] for r in await cur.fetchall()]
+
+
+def chunk(lst, size=20):
+    # Generator that yields successive slices of lst up to `size` elements each
+    # Used to batch mention pings so a single message doesn't exceed Discord's mention limit
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+
+async def build_role_ui(ui_channel_id):
+    # Retrieve the current UI channel object from the bot's internal cache
+    old_channel = bot.get_channel(ui_channel_id)
+    if not old_channel:
+        # Channel not found in cache — can't rebuild, return the ID unchanged
+        log("[UI] UI channel not found, cannot rebuild.")
+        return ui_channel_id
+
+    # Snapshot all properties we need to recreate the channel identically
+    name = old_channel.name                  # Channel name to reuse
+    category = old_channel.category          # Parent category to create the new channel under
+    position = old_channel.position          # Position in the channel list to restore afterward
+    overwrites = old_channel.overwrites      # Permission overwrites to carry over
+    topic = old_channel.topic                # Channel topic to carry over
+    nsfw = old_channel.is_nsfw()             # NSFW flag to carry over
+    slowmode = old_channel.slowmode_delay    # Slowmode setting to carry over
+
+    try:
+        # Delete the old channel — this purges all message history (intentional: clears old bot messages)
+        await old_channel.delete(reason="Rebuilding UI channel")
+        log("[UI] Deleted old UI channel.")
+    except Exception as e:
+        # If deletion fails, abort and return the original ID so the bot state stays consistent
+        log(f"[UI] Failed to delete UI channel: {e}")
+        return ui_channel_id
+
+    try:
+        # Recreate the channel in the same category with all the same settings
+        new_channel = await category.create_text_channel(
+            name=name,
+            overwrites=overwrites,
+            topic=topic,
+            nsfw=nsfw,
+            slowmode_delay=slowmode,
+            reason="Recreating UI channel"
+        )
+        log("[UI] Recreated UI channel.")
+    except Exception as e:
+        # If creation fails, abort — the old channel is already gone at this point
+        log(f"[UI] Failed to recreate UI channel: {e}")
+        return ui_channel_id
+
+    try:
+        # Restore the channel's original position in the sidebar list
+        await new_channel.edit(position=position)
+    except Exception as e:
+        # Non-fatal: wrong position is cosmetic, don't abort the whole rebuild
+        log(f"[UI] Failed to restore channel position: {e}")
+
+    # Persist the new channel ID in the DB so all future lookups use it
+    await db.execute(
+        "UPDATE settings SET value=? WHERE key='ui_channel_id'",
+        (str(new_channel.id),)
+    )
+    await db.commit()
+
+    # Clear all stale message ID mappings — they referred to the old (now deleted) channel
+    await db.execute("DELETE FROM role_ui_messages")
+    await db.commit()
+
+    # Fetch only roles that are linked to at least one channel — orphaned roles are excluded
+    async with db.execute("""
+        SELECT DISTINCT r.id, r.name FROM roles r
+        INNER JOIN channel_roles cr ON cr.role_id = r.id
+        ORDER BY r.id
+    """) as cur:
+        rows = await cur.fetchall()
+
+    # Post one message per role and add the subscribe reaction to it
+    for role_id, role_name in rows:
+        try:
+            # Send the role's UI card into the new channel
+            msg = await new_channel.send(f"**{role_name}**\nReact to subscribe.")
+            # Add the bot's own reaction so users can click it to toggle subscription
+            await msg.add_reaction(ROLE_EMOJI)
+            # Store the message ID so reaction events can be mapped back to this role
+            await db.execute(
+                "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
+                (role_id, msg.id)
+            )
+            log(f"[UI] Created UI message for role '{role_name}'")
+        except Exception as e:
+            # Log failure but continue — partial UI is better than a full crash
+            log(f"[UI] Failed to create UI message for role '{role_name}': {e}")
+
+    # Commit all new role_ui_messages rows in one shot
+    await db.commit()
+    log("[UI] UI rebuild complete.")
+
+    # Return the new channel ID so callers can update their local variable
+    return new_channel.id
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    # Ignore reactions added by the bot itself (e.g. the initial ✅ it places on each card)
+    if payload.user_id == bot.user.id:
+        return
+    # Fetch the current UI channel ID from the DB (may have changed since last rebuild)
+    ui_channel_id = await get_ui_channel_id()
+    # Ignore reactions in any channel other than the role UI channel
+    if payload.channel_id != ui_channel_id:
+        return
+    # Ignore reactions that are not the subscribe emoji
+    if str(payload.emoji) != ROLE_EMOJI:
+        return
+
+    # Look up which role this message corresponds to
+    async with db.execute(
+        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
+    ) as cur:
+        row = await cur.fetchone()
+
+    if row:
+        # Subscribe the user to the role — INSERT OR IGNORE prevents duplicate entries
+        await db.execute(
+            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
+            (payload.user_id, row[0])
+        )
+        await db.commit()
+        log(f"User {payload.user_id} subscribed to role_id {row[0]}")
+
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    # Fetch the current UI channel ID from the DB
+    ui_channel_id = await get_ui_channel_id()
+    # Ignore reactions removed outside the role UI channel
+    if payload.channel_id != ui_channel_id:
+        return
+    # Ignore removal of any emoji that isn't the subscribe emoji
+    if str(payload.emoji) != ROLE_EMOJI:
+        return
+
+    # Look up which role this message corresponds to
+    async with db.execute(
+        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
+    ) as cur:
+        row = await cur.fetchone()
+
+    if row:
+        # Remove the user's subscription for this role
+        await db.execute(
+            "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
+            (payload.user_id, row[0])
+        )
+        await db.commit()
+        log(f"User {payload.user_id} unsubscribed from role_id {row[0]}")
+
 
 @bot.command()
-async def add(ctx, *, msg):
-    if str(ctx.channel.id) not in channels:
-        channels.append(str(ctx.channel.id))
-        roles.append(msg)
-        write('/config/channels.json', channels)
-        write('/config/roles.json',  roles)
+@commands.has_permissions(administrator=True)  # Only admins can add roles
+async def add(ctx, *, role_name):
+    # Insert the role into the DB if it doesn't already exist
+    await db.execute("INSERT OR IGNORE INTO roles(name) VALUES(?)", (role_name,))
+    # Retrieve the role's ID (whether just inserted or pre-existing)
+    async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
+        row = await cur.fetchone()
+    role_id = row[0]
 
-# Events
+    # Link the role to the channel the command was issued in
+    await db.execute(
+        "INSERT OR IGNORE INTO channel_roles(channel_id, role_id) VALUES(?, ?)",
+        (ctx.channel.id, role_id)
+    )
+    await db.commit()
+
+    log(f"Added role '{role_name}' and linked to channel {ctx.channel.id}")
+    await ctx.send(f"Linked role '{role_name}' to this channel")
+    # Rebuild the UI channel so the new role's card appears
+    ui_channel_id = await get_ui_channel_id()
+    ui_channel_id = await build_role_ui(ui_channel_id)
+
+
+@bot.command()
+async def ucheck(ctx, member: discord.Member):
+    # Query all roles the given member is subscribed to, sorted alphabetically
+    async with db.execute(
+        """
+        SELECT r.name FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = ?
+        ORDER BY r.name
+        """,
+        (member.id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        # Member has no subscriptions
+        await ctx.send(f"{member.display_name} has no roles.")
+        log(f"ucheck: {member.id} has no roles.")
+        return
+
+    # Format the list of role names as a bulleted list
+    role_list = "\n".join(f"• {r[0]}" for r in rows)
+    log(f"ucheck: {member.id} has roles: {role_list}")
+    # Send the result publicly in the channel where the command was used
+    await ctx.send(f"**{member.display_name}** is subscribed to:\n{role_list}")
+
+
+@bot.tree.command(name="add", description="Link a role to the current channel")
+@app_commands.checks.has_permissions(administrator=True)  # Only admins can use this slash command
+async def slash_add(interaction: discord.Interaction, role_name: str):
+    # Defer ephemerally so the response is only visible to the invoking admin
+    await interaction.response.defer(ephemeral=True)
+
+    # Insert the role if it doesn't exist, then retrieve its ID
+    await db.execute("INSERT OR IGNORE INTO roles(name) VALUES(?)", (role_name,))
+    async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
+        row = await cur.fetchone()
+    role_id = row[0]
+
+    # Link the role to the channel where the slash command was invoked
+    await db.execute(
+        "INSERT OR IGNORE INTO channel_roles(channel_id, role_id) VALUES(?, ?)",
+        (interaction.channel.id, role_id)
+    )
+    await db.commit()
+
+    log(f"[SLASH] Added role '{role_name}' and linked to channel {interaction.channel.id}")
+    # Rebuild the UI so the new role card appears immediately
+    ui_channel_id = await get_ui_channel_id()
+    ui_channel_id = await build_role_ui(ui_channel_id)
+    await interaction.followup.send(f"Linked role '{role_name}' to this channel.", ephemeral=True)
+
+
+async def hard_delete_role(role_name: str):
+    # Look up the role's internal ID — bail if it doesn't exist
+    async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
+        row = await cur.fetchone()
+
+    if not row:
+        return False, f"Role '{role_name}' not found in DB."
+
+    role_id = row[0]
+
+    # Check if this role has an active UI message in the role channel
+    async with db.execute("SELECT message_id FROM role_ui_messages WHERE role_id=?", (role_id,)) as cur:
+        ui_row = await cur.fetchone()
+
+    if ui_row:
+        message_id = ui_row[0]
+        # Get the current UI channel object from the bot cache
+        ui_channel_id = await get_ui_channel_id()
+        channel = bot.get_channel(ui_channel_id)
+        if channel:
+            try:
+                # Fetch and delete the specific UI message for this role
+                msg = await channel.fetch_message(message_id)
+                await msg.delete()
+                log(f"[DELETE_ROLE] Deleted UI message for role '{role_name}'")
+            except Exception as e:
+                # Non-fatal: message may already be gone (e.g. after a UI rebuild)
+                log(f"[DELETE_ROLE] Failed to delete UI message for role '{role_name}': {e}")
+
+    # Remove all user subscriptions for this role
+    await db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+    # Remove all channel links for this role
+    await db.execute("DELETE FROM channel_roles WHERE role_id=?", (role_id,))
+    # Remove the UI message mapping for this role
+    await db.execute("DELETE FROM role_ui_messages WHERE role_id=?", (role_id,))
+    # Remove the role itself from the roles table
+    await db.execute("DELETE FROM roles WHERE id=?", (role_id,))
+    await db.commit()
+
+    log(f"[DELETE_ROLE] Fully deleted role '{role_name}' (role_id {role_id}) from DB")
+    return True, f"Role '{role_name}' fully deleted from DB."
+
+
+@bot.command(name="delete_role")
+@commands.has_permissions(administrator=True)  # Only admins can delete roles
+async def delete_role_prefix(ctx, *, role_name: str):
+    # Fully delete the role from the DB and remove its UI message
+    ok, msg = await hard_delete_role(role_name)
+
+    await ctx.send(msg)
+    if ok:
+        # Rebuild the UI so the deleted role's card is removed
+        ui_channel_id = await get_ui_channel_id()
+        await build_role_ui(ui_channel_id)
+
+
+@bot.tree.command(name="delete_role", description="Fully delete a role from the database")
+@app_commands.checks.has_permissions(administrator=True)  # Only admins can use this slash command
+async def delete_role_slash(interaction: discord.Interaction, role_name: str):
+    # Defer ephemerally so the response is only visible to the invoking admin
+    await interaction.response.defer(ephemeral=True)
+
+    # Fully delete the role from the DB and remove its UI message
+    ok, msg = await hard_delete_role(role_name)
+    await interaction.followup.send(msg, ephemeral=True)
+
+    if ok:
+        # Rebuild the UI so the deleted role's card is removed
+        ui_channel_id = await get_ui_channel_id()
+        ui_channel_id = await build_role_ui(ui_channel_id)
+
+
+@bot.command(name="rebuild_ui")
+@commands.has_permissions(administrator=True)  # Only admins can trigger a UI rebuild
+async def rebuild_ui_prefix(ctx):
+    # Fetch the current UI channel ID and trigger a full rebuild
+    ui_channel_id = await get_ui_channel_id()
+    ui_channel_id = await build_role_ui(ui_channel_id)
+    await ctx.send("UI rebuilt.")
+
+
+@bot.tree.command(name="rebuild_ui", description="Rebuild the role UI channel")
+@app_commands.checks.has_permissions(administrator=True)  # Only admins can use this slash command
+async def rebuild_ui_slash(interaction: discord.Interaction):
+    # Defer ephemerally so the response is only visible to the invoking admin
+    await interaction.response.defer(ephemeral=True)
+    # Fetch the current UI channel ID and trigger a full rebuild
+    ui_channel_id = await get_ui_channel_id()
+    ui_channel_id = await build_role_ui(ui_channel_id)
+    await interaction.followup.send("UI rebuilt.", ephemeral=True)
+
+
+@bot.tree.command(name="migrate", description="Migrate all users from Discord roles to DB and delete roles")
+async def migrate(interaction: discord.Interaction):
+    # Defer ephemerally — this can take a while on large servers
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    # Force-populate the member cache so member.roles is accurate for every member
+    await guild.chunk()
+
+    # Build a name → db_id lookup for all roles currently in the DB
+    async with db.execute("SELECT id, name FROM roles") as cur:
+        db_roles = {name: db_id for db_id, name in await cur.fetchall()}
+
+    roles_to_delete = []  # Discord role objects to delete after DB writes are complete
+    migrated_users = 0    # Counter for logging/reporting
+
+    # Iterate every cached member and check their Discord roles against the DB
+    # This approach is used instead of role.members because role.members is unreliable
+    # even with chunking — iterating members and checking their roles is always accurate
+    for member in guild.members:
+        for role in member.roles:
+            if role.name in db_roles:
+                db_role_id = db_roles[role.name]
+                # Insert the subscription — OR IGNORE prevents duplicates if run more than once
+                await db.execute(
+                    "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
+                    (member.id, db_role_id)
+                )
+                migrated_users += 1
+                log(f"[MIGRATE] {member.id} → role '{role.name}' (db_id {db_role_id})")
+
+    # Commit all user_role insertions in a single transaction
+    await db.commit()
+
+    # Collect the Discord role objects that need to be deleted from the server
+    for role in guild.roles:
+        if role.name in db_roles:
+            roles_to_delete.append(role)
+
+    # Delete each matched Discord role from the server
+    deleted = 0
+    for role in roles_to_delete:
+        try:
+            await role.delete(reason="Migrated to DB roles")
+            deleted += 1
+        except Exception as e:
+            # Log but don't abort — partial migration is better than crashing
+            log(f"Failed to delete role {role.name}: {e}")
+
+    await interaction.followup.send(
+        f"Migration complete. Migrated {migrated_users} user-role entries. Deleted {deleted} roles.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="ucheck", description="Check which roles a user is subscribed to")
+async def slash_ucheck(interaction: discord.Interaction, member: discord.Member):
+    # Defer ephemerally so the role list is only visible to the person who ran the command
+    await interaction.response.defer(ephemeral=True)
+
+    # Query all roles the given member is subscribed to, sorted alphabetically
+    async with db.execute(
+        """
+        SELECT r.name FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = ?
+        ORDER BY r.name
+        """,
+        (member.id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        log(f"[SLASH] ucheck: {member.id} has no roles.")
+        await interaction.followup.send(f"{member.display_name} has no roles.", ephemeral=True)
+        return
+
+    # Format the list of role names as a bulleted list
+    role_list = "\n".join(f"• {r[0]}" for r in rows)
+    log(f"[SLASH] ucheck: {member.id} has roles: {role_list}")
+    await interaction.followup.send(
+        f"**{member.display_name}** is subscribed to:\n{role_list}",
+        ephemeral=True
+    )
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    # Catch missing-permission errors for prefix commands and respond with a user-friendly message
+    if isinstance(error, commands.MissingPermissions):
+        log(f"Permission denied for user {ctx.author.id} on command '{ctx.command}'.")
+        await ctx.send("You must be an administrator to use this command.")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    # Catch missing-permission errors for slash commands and respond ephemerally
+    if isinstance(error, app_commands.MissingPermissions):
+        log(f"[SLASH] Permission denied for user {interaction.user.id} on slash command.")
+        await interaction.response.send_message(
+            "You must be an administrator to use this command.",
+            ephemeral=True
+        )
+
+
 @bot.event
 async def on_message(message):
-    if (message.attachments and (str(message.channel.id) in channels)):
-        s = message.attachments[0].url
-        if s.split("?")[0].lower().endswith(('.epub', '.txt', '.docx', '.pdf')):
-            ind = channels.index(str(message.channel.id))
-            role = discord.utils.get(message.guild.roles, name=roles[ind])
-            await message.channel.send(role.mention)
+    # Determine the effective channel ID — for threads/forum posts use the parent channel
+    channel_id = message.channel.id
+    parent = getattr(message.channel, "parent", None)
+    if parent is not None:
+        # Thread or forum post: use the parent channel ID for role lookups
+        channel_id = parent.id
+
+    log(f"on_message in channel {message.channel.id} (effective {channel_id}), has_attachments={bool(message.attachments)}")
+
+    # Look up which roles are linked to this effective channel
+    async with db.execute(
+        "SELECT role_id FROM channel_roles WHERE channel_id=?", (channel_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    log(f"Found {len(rows)} role mappings for channel_id {channel_id}")
+
+    # Only process if the message has attachments, the channel has linked roles,
+    # and the author hasn't suppressed pings with the -nopingy flag
+    if message.attachments and rows and "-nopingy" not in message.content:
+        file_url = message.attachments[0].url
+
+        # Strip Discord's CDN query parameters before checking the file extension
+        clean_url = file_url.split("?")[0].lower()
+
+        # Only react to ebook/document file types the server cares about
+        valid = clean_url.endswith((".epub", ".txt", ".docx", ".pdf"))
+
+        log(f"File URL: {file_url}")
+        log(f"Clean URL: {clean_url}")
+        log(f"Valid extension: {valid}")
+
+        if valid:
+            log(f"Detected new file in channel {channel_id}: {file_url}")
+
+            # For each role linked to this channel, ping its subscribers
+            for (role_id,) in rows:
+                users = await get_users_for_role(role_id)
+
+                log(f"DEBUG: get_users_for_role({role_id}) returned {len(users)} users: {users}")
+
+                if users:
+                    log(f"Pinging {len(users)} users for role_id {role_id} (message {message.id})")
+
+                # Send mentions in batches of 20 to stay within Discord's per-message mention limit
+                for group in chunk(users, 20):
+                    mentions = " ".join(f"<@{u}>" for u in group)
+                    msg = await message.channel.send(mentions)
+                    # Delete the ping message after 2 seconds — it only needs to trigger notifications
+                    await msg.delete(delay=2)
+
+            # Keep the pin list from hitting Discord's 50-pin limit
             pins = await message.channel.pins()
-            if (len(pins) > 48):
-               await pins[-1].unpin()
-            await message.pin(reason=None)
-    else:
-        if (message.type == discord.MessageType.pins_add):
-            await message.delete()
-        await bot.process_commands(message)
+            if len(pins) > 48:
+                # Unpin the oldest message to make room
+                await pins[-1].unpin()
+                log("Unpinned oldest message due to pin limit.")
+
+            # Pin the new file message so it's easy to find later
+            await message.pin()
+            log(f"Pinned message {message.id}")
+
+    # Discord automatically posts a "X pinned a message" system message after every pin
+    # Delete it immediately to keep the channel clean
+    if message.type == discord.MessageType.pins_add:
+        await message.delete()
+        log("Deleted automatic pin notification.")
+
+    # Must be called at the end of on_message so prefix commands still work
+    await bot.process_commands(message)
+
+
+@tasks.loop(hours=1)
+async def cleanup_users():
+    # Run once per hour to prune subscriptions for users who have left the server
+    for guild in bot.guilds:
+        # Build the set of currently present member IDs
+        valid_ids = {member.id for member in guild.members}
+
+        # Fetch all user IDs that currently have at least one subscription in the DB
+        async with db.execute("SELECT user_id FROM user_roles") as cur:
+            all_ids = {r[0] for r in await cur.fetchall()}
+
+        # Any ID in the DB but not in the guild is a former member — remove their subscriptions
+        invalid = all_ids - valid_ids
+
+        for uid in invalid:
+            await db.execute("DELETE FROM user_roles WHERE user_id=?", (uid,))
+
+        await db.commit()
+
+        if invalid:
+            log(f"Cleanup removed {len(invalid)} stale user-role entries.")
+
 
 @bot.event
 async def on_ready():
-    game = discord.Game("with channels")
-    await bot.change_presence(status=discord.Status.idle, activity=game)
-    print('Bot has started')
+    # Sync the slash command tree with Discord so /commands appear in the UI
+    await bot.tree.sync()
+    log("Bot is ready. Slash commands synced.")
 
-bot.run(os.getenv('discord_token'))
+    # Start the hourly cleanup loop if it isn't already running (guards against on_ready firing twice)
+    if not cleanup_users.is_running():
+        cleanup_users.start()
+        log("Cleanup task started.")
+
+    # Rebuild the UI channel on every startup to purge stale messages
+    ui_channel_id = await get_ui_channel_id()
+    ui_channel_id = await build_role_ui(ui_channel_id)
+    log("Initial UI build completed.")
+
+
+async def is_db_empty():
+    # Returns True if no roles have been defined yet — used to decide whether to run legacy import
+    try:
+        async with db.execute("SELECT COUNT(*) FROM roles") as cur:
+            row = await cur.fetchone()
+        return row[0] == 0
+    except Exception as e:
+        log(f"DB check failed: {e}")
+        # If the check itself fails, treat as empty so legacy import is attempted
+        return True
+
+
+async def main():
+    # Initialize the DB schema before anything else
+    await init_db()
+
+    # If no roles exist yet, try to seed the DB from the legacy JSON config files
+    if await is_db_empty():
+        log("Database empty — attempting legacy import.")
+        await import_legacy()
+
+    log("Starting bot...")
+    # Start the bot — this blocks until the bot is disconnected
+    await bot.start(os.getenv('discord_token'))  # Replace with your token via env var or config file, never hardcode
+
+
+asyncio.run(main())  # Entry point: run the async main() function using the default event loop
