@@ -26,6 +26,10 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', description="This is a Fic notification Bot", intents=intents)
 # Global DB connection handle, assigned in init_db() before the bot starts
 db: aiosqlite.Connection = None
+# Cache for UI channel ID to avoid DB lookups
+CACHED_UI_CHANNEL_ID = None
+# Flag to prevent on_ready startup tasks from running multiple times on reconnects
+bot_ready = False
 
 
 def log(msg: str):
@@ -97,19 +101,29 @@ async def init_db():
     )
     ''')
 
+    # Add indexes for faster lookups
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_role_ui_messages_msg_id ON role_ui_messages(message_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_user_roles_role_id ON user_roles(role_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_channel_roles_channel_id ON channel_roles(channel_id)")
+
     # Persist all schema changes
     await db.commit()
     log("Database initialized.")
 
 
 async def get_ui_channel_id():
+    global CACHED_UI_CHANNEL_ID
+    if CACHED_UI_CHANNEL_ID is not None:
+        return CACHED_UI_CHANNEL_ID
+
     # Query the settings table for the current UI channel ID
     async with db.execute("SELECT value FROM settings WHERE key='ui_channel_id'") as cur:
         row = await cur.fetchone()
 
     # If found, cast from stored string to int and return
     if row:
-        return int(row[0])
+        CACHED_UI_CHANNEL_ID = int(row[0])
+        return CACHED_UI_CHANNEL_ID
 
     # First run: no entry exists yet — seed it with the hardcoded fallback constant
     initial_id = ROLE_UI_CHANNEL
@@ -121,6 +135,7 @@ async def get_ui_channel_id():
     )
     await db.commit()
 
+    CACHED_UI_CHANNEL_ID = initial_id
     return initial_id
 
 
@@ -199,7 +214,7 @@ async def get_users_for_role(role_id):
         return [r[0] for r in await cur.fetchall()]
 
 
-def chunk(lst, size=20):
+def chunk(lst, size=50):
     # Generator that yields successive slices of lst up to `size` elements each
     # Used to batch mention pings so a single message doesn't exceed Discord's mention limit
     for i in range(0, len(lst), size):
@@ -208,61 +223,21 @@ def chunk(lst, size=20):
 
 async def build_role_ui(ui_channel_id):
     # Retrieve the current UI channel object from the bot's internal cache
-    old_channel = bot.get_channel(ui_channel_id)
-    if not old_channel:
+    channel = bot.get_channel(ui_channel_id)
+    if not channel:
         # Channel not found in cache — can't rebuild, return the ID unchanged
         log("[UI] UI channel not found, cannot rebuild.")
         return ui_channel_id
 
-    # Snapshot all properties we need to recreate the channel identically
-    name = old_channel.name                  # Channel name to reuse
-    category = old_channel.category          # Parent category to create the new channel under
-    position = old_channel.position          # Position in the channel list to restore afterward
-    overwrites = old_channel.overwrites      # Permission overwrites to carry over
-    topic = old_channel.topic                # Channel topic to carry over
-    nsfw = old_channel.is_nsfw()             # NSFW flag to carry over
-    slowmode = old_channel.slowmode_delay    # Slowmode setting to carry over
-
     try:
-        # Delete the old channel — this purges all message history (intentional: clears old bot messages)
-        await old_channel.delete(reason="Rebuilding UI channel")
-        log("[UI] Deleted old UI channel.")
+        # Purge all messages in the channel to clear old UI messages
+        await channel.purge(limit=None, reason="Rebuilding UI channel")
+        log("[UI] Purged old UI channel messages.")
     except Exception as e:
-        # If deletion fails, abort and return the original ID so the bot state stays consistent
-        log(f"[UI] Failed to delete UI channel: {e}")
+        log(f"[UI] Failed to purge UI channel: {e}")
         return ui_channel_id
 
-    try:
-        # Recreate the channel in the same category with all the same settings
-        new_channel = await category.create_text_channel(
-            name=name,
-            overwrites=overwrites,
-            topic=topic,
-            nsfw=nsfw,
-            slowmode_delay=slowmode,
-            reason="Recreating UI channel"
-        )
-        log("[UI] Recreated UI channel.")
-    except Exception as e:
-        # If creation fails, abort — the old channel is already gone at this point
-        log(f"[UI] Failed to recreate UI channel: {e}")
-        return ui_channel_id
-
-    try:
-        # Restore the channel's original position in the sidebar list
-        await new_channel.edit(position=position)
-    except Exception as e:
-        # Non-fatal: wrong position is cosmetic, don't abort the whole rebuild
-        log(f"[UI] Failed to restore channel position: {e}")
-
-    # Persist the new channel ID in the DB so all future lookups use it
-    await db.execute(
-        "UPDATE settings SET value=? WHERE key='ui_channel_id'",
-        (str(new_channel.id),)
-    )
-    await db.commit()
-
-    # Clear all stale message ID mappings — they referred to the old (now deleted) channel
+    # Clear all stale message ID mappings
     await db.execute("DELETE FROM role_ui_messages")
     await db.commit()
 
@@ -277,8 +252,8 @@ async def build_role_ui(ui_channel_id):
     # Post one message per role and add the subscribe reaction to it
     for role_id, role_name in rows:
         try:
-            # Send the role's UI card into the new channel
-            msg = await new_channel.send(f"**{role_name}**\nReact to subscribe.")
+            # Send the role's UI card into the channel
+            msg = await channel.send(f"**{role_name}**\nReact to subscribe.")
             # Add the bot's own reaction so users can click it to toggle subscription
             await msg.add_reaction(ROLE_EMOJI)
             # Store the message ID so reaction events can be mapped back to this role
@@ -295,8 +270,8 @@ async def build_role_ui(ui_channel_id):
     await db.commit()
     log("[UI] UI rebuild complete.")
 
-    # Return the new channel ID so callers can update their local variable
-    return new_channel.id
+    # Return the channel ID unchanged
+    return channel.id
 
 
 @bot.event
@@ -544,17 +519,21 @@ async def migrate(interaction: discord.Interaction):
     # Iterate every cached member and check their Discord roles against the DB
     # This approach is used instead of role.members because role.members is unreliable
     # even with chunking — iterating members and checking their roles is always accurate
+    insert_params = []
     for member in guild.members:
         for role in member.roles:
             if role.name in db_roles:
                 db_role_id = db_roles[role.name]
-                # Insert the subscription — OR IGNORE prevents duplicates if run more than once
-                await db.execute(
-                    "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
-                    (member.id, db_role_id)
-                )
+                insert_params.append((member.id, db_role_id))
                 migrated_users += 1
                 log(f"[MIGRATE] {member.id} → role '{role.name}' (db_id {db_role_id})")
+
+    if insert_params:
+        # Insert all subscriptions in batch
+        await db.executemany(
+            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
+            insert_params
+        )
 
     # Commit all user_role insertions in a single transaction
     await db.commit()
@@ -652,32 +631,35 @@ async def on_message(message):
     # Only process if the message has attachments, the channel has linked roles,
     # and the author hasn't suppressed pings with the -nopingy flag
     if message.attachments and rows and "-nopingy" not in message.content:
+        # Use the filename of the first attachment to check extension
+        filename = message.attachments[0].filename.lower()
         file_url = message.attachments[0].url
 
-        # Strip Discord's CDN query parameters before checking the file extension
-        clean_url = file_url.split("?")[0].lower()
-
         # Only react to ebook/document file types the server cares about
-        valid = clean_url.endswith((".epub", ".txt", ".docx", ".pdf"))
+        valid = filename.endswith((".epub", ".txt", ".docx", ".pdf"))
 
         log(f"File URL: {file_url}")
-        log(f"Clean URL: {clean_url}")
+        log(f"Filename: {filename}")
         log(f"Valid extension: {valid}")
 
         if valid:
             log(f"Detected new file in channel {channel_id}: {file_url}")
 
-            # For each role linked to this channel, ping its subscribers
+            # Collect unique user IDs for all linked roles to prevent duplicate pings
+            unique_users = set()
             for (role_id,) in rows:
                 users = await get_users_for_role(role_id)
-
                 log(f"DEBUG: get_users_for_role({role_id}) returned {len(users)} users: {users}")
-
                 if users:
-                    log(f"Pinging {len(users)} users for role_id {role_id} (message {message.id})")
+                    unique_users.update(users)
 
-                # Send mentions in batches of 20 to stay within Discord's per-message mention limit
-                for group in chunk(users, 20):
+            users_list = list(unique_users)
+
+            if users_list:
+                log(f"Pinging {len(users_list)} unique users for {len(rows)} roles (message {message.id})")
+
+                # Send mentions in batches of 50 to stay within Discord's per-message mention limit
+                for group in chunk(users_list, 50):
                     mentions = " ".join(f"<@{u}>" for u in group)
                     msg = await message.channel.send(mentions)
                     # Delete the ping message after 2 seconds — it only needs to trigger notifications
@@ -718,10 +700,10 @@ async def cleanup_users():
         # Any ID in the DB but not in the guild is a former member — remove their subscriptions
         invalid = all_ids - valid_ids
 
-        for uid in invalid:
-            await db.execute("DELETE FROM user_roles WHERE user_id=?", (uid,))
-
-        await db.commit()
+        if invalid:
+            # Execute deletions in batch
+            await db.executemany("DELETE FROM user_roles WHERE user_id=?", [(uid,) for uid in invalid])
+            await db.commit()
 
         if invalid:
             log(f"Cleanup removed {len(invalid)} stale user-role entries.")
@@ -729,6 +711,11 @@ async def cleanup_users():
 
 @bot.event
 async def on_ready():
+    global bot_ready
+    if bot_ready:
+        log("Reconnected to Discord. Startup tasks already completed.")
+        return
+
     # Sync the slash command tree with Discord so /commands appear in the UI
     await bot.tree.sync()
     log("Bot is ready. Slash commands synced.")
@@ -742,6 +729,8 @@ async def on_ready():
     ui_channel_id = await get_ui_channel_id()
     ui_channel_id = await build_role_ui(ui_channel_id)
     log("Initial UI build completed.")
+
+    bot_ready = True
 
 
 async def is_db_empty():
