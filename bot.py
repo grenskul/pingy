@@ -15,8 +15,8 @@ CONFIG_CHANNELS = "/config/channels.json"
 CONFIG_ROLES = "/config/roles.json"
 # Fallback channel ID used only on the very first run before the DB has a ui_channel_id entry
 ROLE_UI_CHANNEL = int(os.getenv('roles_channel'))
-# The emoji users react with to subscribe/unsubscribe from a role
-ROLE_EMOJI = "✅"
+# Label used on each role's subscription button
+ROLE_BUTTON_LABEL = "Toggle Subscription"
 # Path to the flag file written when legacy import fails, signals a fresh DB is needed
 DB_FAIL_FILE = "/config/newDB"
 
@@ -205,6 +205,75 @@ def chunk(lst, size=20):
     for i in range(0, len(lst), size):
         yield lst[i:i+size]
 
+class RoleToggleView(discord.ui.View):
+    def __init__(self, role_id: int, role_name: str):
+        # timeout=None makes the component persistent for the lifetime of the
+        # process; since this bot rebuilds the UI channel on startup, that is
+        # enough for this design.
+        super().__init__(timeout=None)
+        self.role_id = role_id
+        self.role_name = role_name
+
+        button = discord.ui.Button(
+            label=ROLE_BUTTON_LABEL,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"role_toggle:{role_id}"
+        )
+        button.callback = self.toggle_subscription
+        self.add_item(button)
+
+    async def toggle_subscription(self, interaction: discord.Interaction):
+        # If a stale UI message somehow survives, don't allow toggling a role
+        # that no longer exists.
+        async with db.execute(
+            "SELECT 1 FROM roles WHERE id=?", (self.role_id,)
+        ) as cur:
+            role_row = await cur.fetchone()
+
+        if not role_row:
+            await interaction.response.send_message(
+                "This role no longer exists.",
+                ephemeral=True
+            )
+            return
+
+        # Toggle the user's subscription state in the DB.
+        async with db.execute(
+            "SELECT 1 FROM user_roles WHERE user_id=? AND role_id=?",
+            (interaction.user.id, self.role_id)
+        ) as cur:
+            subscribed = await cur.fetchone()
+
+        if subscribed:
+            await db.execute(
+                "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
+                (interaction.user.id, self.role_id)
+            )
+            await db.commit()
+            log(
+                f"User {interaction.user.id} unsubscribed from role_id "
+                f"{self.role_id}"
+            )
+            await interaction.response.send_message(
+                f"Unsubscribed from '{self.role_name}'.",
+                ephemeral=True
+            )
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO user_roles(user_id, role_id) "
+                "VALUES(?, ?)",
+                (interaction.user.id, self.role_id)
+            )
+            await db.commit()
+            log(
+                f"User {interaction.user.id} subscribed to role_id "
+                f"{self.role_id}"
+            )
+            await interaction.response.send_message(
+                f"Subscribed to '{self.role_name}'.",
+                ephemeral=True
+            )
+
 
 async def build_role_ui(ui_channel_id):
     # Retrieve the current UI channel object from the bot's internal cache
@@ -274,14 +343,15 @@ async def build_role_ui(ui_channel_id):
     """) as cur:
         rows = await cur.fetchall()
 
-    # Post one message per role and add the subscribe reaction to it
+    # Post one message per role and attach a toggle-subscription button
     for role_id, role_name in rows:
         try:
             # Send the role's UI card into the new channel
-            msg = await new_channel.send(f"**{role_name}**\nReact to subscribe.")
-            # Add the bot's own reaction so users can click it to toggle subscription
-            await msg.add_reaction(ROLE_EMOJI)
-            # Store the message ID so reaction events can be mapped back to this role
+            msg = await new_channel.send(
+                f"**{role_name}**\nClick the button to subscribe/unsubscribe.",
+                view=RoleToggleView(role_id, role_name)
+            )
+            # Store the message ID so the UI entry for this role can be tracked
             await db.execute(
                 "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
                 (role_id, msg.id)
@@ -297,63 +367,6 @@ async def build_role_ui(ui_channel_id):
 
     # Return the new channel ID so callers can update their local variable
     return new_channel.id
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-    # Ignore reactions added by the bot itself (e.g. the initial ✅ it places on each card)
-    if payload.user_id == bot.user.id:
-        return
-    # Fetch the current UI channel ID from the DB (may have changed since last rebuild)
-    ui_channel_id = await get_ui_channel_id()
-    # Ignore reactions in any channel other than the role UI channel
-    if payload.channel_id != ui_channel_id:
-        return
-    # Ignore reactions that are not the subscribe emoji
-    if str(payload.emoji) != ROLE_EMOJI:
-        return
-
-    # Look up which role this message corresponds to
-    async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
-    ) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        # Subscribe the user to the role — INSERT OR IGNORE prevents duplicate entries
-        await db.execute(
-            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
-            (payload.user_id, row[0])
-        )
-        await db.commit()
-        log(f"User {payload.user_id} subscribed to role_id {row[0]}")
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    # Fetch the current UI channel ID from the DB
-    ui_channel_id = await get_ui_channel_id()
-    # Ignore reactions removed outside the role UI channel
-    if payload.channel_id != ui_channel_id:
-        return
-    # Ignore removal of any emoji that isn't the subscribe emoji
-    if str(payload.emoji) != ROLE_EMOJI:
-        return
-
-    # Look up which role this message corresponds to
-    async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
-    ) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        # Remove the user's subscription for this role
-        await db.execute(
-            "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
-            (payload.user_id, row[0])
-        )
-        await db.commit()
-        log(f"User {payload.user_id} unsubscribed from role_id {row[0]}")
 
 
 @bot.command()
