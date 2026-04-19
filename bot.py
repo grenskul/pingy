@@ -193,6 +193,13 @@ async def get_role_id(role_name):
     return row[0] if row else None
 
 
+async def get_role_name(role_id):
+    # Look up the role name by internal role ID; returns None if missing
+    async with db.execute("SELECT name FROM roles WHERE id=?", (role_id,)) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def get_users_for_role(role_id):
     # Return a list of Discord user IDs subscribed to the given internal role ID
     async with db.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)) as cur:
@@ -320,40 +327,63 @@ async def on_raw_reaction_add(payload):
         row = await cur.fetchone()
 
     if row:
-        # Subscribe the user to the role — INSERT OR IGNORE prevents duplicate entries
-        await db.execute(
-            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
-            (payload.user_id, row[0])
-        )
-        await db.commit()
-        log(f"User {payload.user_id} subscribed to role_id {row[0]}")
+        role_id = row[0]
+        role_name = await get_role_name(role_id)
+
+        # Toggle subscription state on reaction add
+        async with db.execute(
+            "SELECT 1 FROM user_roles WHERE user_id=? AND role_id=?",
+            (payload.user_id, role_id)
+        ) as cur:
+            exists = await cur.fetchone()
+
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+
+        if exists:
+            await db.execute(
+                "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
+                (payload.user_id, role_id)
+            )
+            await db.commit()
+            log(f"User {payload.user_id} unsubscribed from role_id {role_id}")
+            await channel.send(
+                f"<@{payload.user_id}> You are unsubscribed from {role_name}",
+                delete_after=10
+            )
+        else:
+            await db.execute(
+                "INSERT INTO user_roles(user_id, role_id) VALUES(?, ?)",
+                (payload.user_id, role_id)
+            )
+            await db.commit()
+            log(f"User {payload.user_id} subscribed to role_id {role_id}")
+            await channel.send(
+                f"<@{payload.user_id}> You are subscribed to {role_name}",
+                delete_after=10
+            )
+
+        # Remove the user's reaction so the UI acts like a button instead of a persistent reaction
+        try:
+            if channel:
+                msg = await channel.fetch_message(payload.message_id)
+                member = payload.member
+                if member is None and payload.guild_id:
+                    guild = bot.get_guild(payload.guild_id)
+                    if guild:
+                        member = guild.get_member(payload.user_id) or await guild.fetch_member(
+                            payload.user_id
+                        )
+                if member:
+                    await msg.remove_reaction(payload.emoji, member)
+        except Exception as e:
+            log(f"Failed to remove reaction for user {payload.user_id}: {e}")
 
 
 @bot.event
 async def on_raw_reaction_remove(payload):
-    # Fetch the current UI channel ID from the DB
-    ui_channel_id = await get_ui_channel_id()
-    # Ignore reactions removed outside the role UI channel
-    if payload.channel_id != ui_channel_id:
-        return
-    # Ignore removal of any emoji that isn't the subscribe emoji
-    if str(payload.emoji) != ROLE_EMOJI:
-        return
-
-    # Look up which role this message corresponds to
-    async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
-    ) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        # Remove the user's subscription for this role
-        await db.execute(
-            "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
-            (payload.user_id, row[0])
-        )
-        await db.commit()
-        log(f"User {payload.user_id} unsubscribed from role_id {row[0]}")
+    # Reaction removals are ignored because subscriptions now toggle on reaction add,
+    # and the bot auto-removes user reactions to keep the UI clean.
+    return
 
 
 @bot.command()
