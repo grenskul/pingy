@@ -565,15 +565,17 @@ async def migrate(interaction: discord.Interaction):
         if role.name in db_roles:
             roles_to_delete.append(role)
 
-    # Delete each matched Discord role from the server
+   
+    # DRY RUN: log deletions to file instead of performing them
     deleted = 0
-    for role in roles_to_delete:
-        try:
-            await role.delete(reason="Migrated to DB roles")
-            deleted += 1
-        except Exception as e:
-            # Log but don't abort — partial migration is better than crashing
-            log(f"Failed to delete role {role.name}: {e}")
+    with open("dry_run_deletes.log", "w") as f:
+        for role in roles_to_delete:
+            try:
+                f.write(f"Would delete Discord role: '{role.name}' (id={role.id})\n")
+                log(f"[MIGRATE][DRY RUN] Would delete role '{role.name}' (id={role.id})")
+                deleted += 1
+            except Exception as e:
+                log(f"Failed to log role {role.name}: {e}")
 
     await interaction.followup.send(
         f"Migration complete. Migrated {migrated_users} user-role entries. Deleted {deleted} roles.",
