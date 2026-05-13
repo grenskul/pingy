@@ -6,6 +6,8 @@ import json                             # Used to parse legacy config files (cha
 import os                               # Used to check if files exist before reading them
 import asyncio                          # Needed to run the async main() entry point
 import datetime                         # Used to generate timestamps in log messages
+import time
+
 
 # Absolute path to the SQLite database file
 DB_PATH = "/config/bot.db"
@@ -267,7 +269,6 @@ async def build_role_ui(ui_channel_id):
         (str(new_channel.id),)
     )
     await db.commit()
-
     await db.execute("DELETE FROM role_ui_messages")
     await db.commit()
 
@@ -276,13 +277,23 @@ async def build_role_ui(ui_channel_id):
 
     for role_id, role_name in rows:
         try:
-            msg = await new_channel.send(f"**{role_name}**")
-            await msg.add_reaction("✅")
+            time.sleep(0.1)
+            async with db.execute(
+                "SELECT channel_id FROM channel_roles WHERE role_id=?", (role_id,)
+            ) as cur:
+                ch_row = await cur.fetchone()
+
+            if not ch_row:
+                log(f"[UI] Role '{role_name}' has no linked channel — skipping.")
+                continue
+
+            msg = await new_channel.send(f"<#{ch_row[0]}>")
+            await msg.add_reaction(ROLE_EMOJI)
             await db.execute(
                 "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
                 (role_id, msg.id)
             )
-            log(f"[UI] Created UI message for role '{role_name}'")
+            log(f"[UI] Created UI message for role '{role_name}' → <#{ch_row[0]}>")
         except Exception as e:
             log(f"[UI] Failed to create UI message for role '{role_name}': {e}")
 
@@ -320,7 +331,9 @@ async def on_raw_reaction_add(payload):
             (payload.user_id, row[0])
         )
         await db.commit()
-        log(f"User {payload.user_id} subscribed to role_id {row[0]}")
+        role_name = role_row[0] if role_row else str(row[0])
+        log(f"User {payload.user_id} subscribed to '{role_name}'")
+
 
 
 @bot.event
@@ -399,6 +412,119 @@ async def ucheck(ctx, member: discord.Member):
     log(f"ucheck: {member.id} has roles: {role_list}")
     # Send the result publicly in the channel where the command was used
     await ctx.send(f"**{member.display_name}** is subscribed to:\n{role_list}")
+
+
+
+@bot.command()
+async def rcheck(ctx, *, role_name: str):
+    # Look up the role by name — role names may contain spaces so we use *
+    role_id = await get_role_id(role_name)
+    if not role_id:
+        await ctx.send(f"Role \"{role_name}\" not found.")
+        log(f"rcheck: role \"{role_name}\" not found.")
+        return
+
+    # Fetch all user IDs subscribed to this role
+    async with db.execute(
+        """
+        SELECT ur.user_id FROM user_roles ur
+        WHERE ur.role_id = ?
+        """,
+        (role_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        await ctx.send(f"No users are subscribed to **{role_name}**.")
+        log(f"rcheck: no users for role \"{role_name}\".")
+        return
+
+    # Resolve user IDs to display names — fall back to raw ID if the member isn't cached
+    guild = ctx.guild
+    names = []
+    for (user_id,) in rows:
+        member = guild.get_member(user_id)
+        names.append(member.display_name if member else str(user_id))
+
+    names.sort()
+    log(f"rcheck: role \"{role_name}\" has {len(names)} subscribers.")
+
+    # Discord messages cap at 2000 characters — chunk the list if it's long
+    header = f"**{role_name}** — {len(names)} subscriber(s):\n"
+    lines = [f"• {n}" for n in names]
+    message = header + "\n".join(lines)
+
+    if len(message) <= 2000:
+        await ctx.send(message)
+    else:
+        # Send header first, then batches of lines that fit within the limit
+        await ctx.send(header.strip())
+        batch = ""
+        for line in lines:
+            if len(batch) + len(line) + 1 > 2000:
+                await ctx.send(batch.strip())
+                batch = ""
+            batch += line + "\n"
+        if batch:
+            await ctx.send(batch.strip())
+
+
+@bot.tree.command(name="rcheck", description="List all users subscribed to a role")
+async def slash_rcheck(interaction: discord.Interaction, role_name: str):
+    # Defer publicly so the result is visible to everyone in the channel
+    await interaction.response.defer(ephemeral=False)
+
+    # Look up the role by name
+    role_id = await get_role_id(role_name)
+    if not role_id:
+        await interaction.followup.send(f"Role \"{role_name}\" not found.")
+        log(f"[SLASH] rcheck: role \"{role_name}\" not found.")
+        return
+
+    # Fetch all user IDs subscribed to this role
+    async with db.execute(
+        """
+        SELECT ur.user_id FROM user_roles ur
+        WHERE ur.role_id = ?
+        """,
+        (role_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        await interaction.followup.send(f"No users are subscribed to **{role_name}**.")
+        log(f"[SLASH] rcheck: no users for role \"{role_name}\".")
+        return
+
+    # Resolve user IDs to display names — fall back to raw ID if the member isn't cached
+    guild = interaction.guild
+    names = []
+    for (user_id,) in rows:
+        member = guild.get_member(user_id)
+        names.append(member.display_name if member else str(user_id))
+
+    names.sort()
+    log(f"[SLASH] rcheck: role \"{role_name}\" has {len(names)} subscribers.")
+
+    # Build the response and chunk it if it exceeds Discord's 2000-character limit
+    header = f"**{role_name}** — {len(names)} subscriber(s):\n"
+    lines = [f"• {n}" for n in names]
+    message = header + "\n".join(lines)
+
+    if len(message) <= 2000:
+        await interaction.followup.send(message)
+    else:
+        await interaction.followup.send(header.strip())
+        batch = ""
+        for line in lines:
+            if len(batch) + len(line) + 1 > 2000:
+                await interaction.channel.send(batch.strip())
+                batch = ""
+            batch += line + "\n"
+        if batch:
+            await interaction.channel.send(batch.strip())
+
+
 
 
 @bot.tree.command(name="add", description="Link a role to the current channel")
@@ -677,8 +803,8 @@ async def on_message(message):
                 for group in chunk(users, 20):
                     mentions = " ".join(f"<@{u}>" for u in group)
                     msg = await message.channel.send(mentions)
-                    # Delete the ping message after 2 seconds — it only needs to trigger notifications
-                    await msg.delete(delay=2)
+                    # Delete the ping message after 7 seconds — it only needs to trigger notifications
+                    await msg.delete(delay=7)
 
             # Keep the pin list from hitting Discord's 50-pin limit
             pins = await message.channel.pins()
