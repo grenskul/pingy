@@ -207,96 +207,90 @@ def chunk(lst, size=20):
 
 
 async def build_role_ui(ui_channel_id):
-    # Retrieve the current UI channel object from the bot's internal cache
+    # Fetch the existing UI channel using the DB value
     old_channel = bot.get_channel(ui_channel_id)
     if not old_channel:
-        # Channel not found in cache — can't rebuild, return the ID unchanged
         log("[UI] UI channel not found, cannot rebuild.")
         return ui_channel_id
 
-    # Snapshot all properties we need to recreate the channel identically
-    name = old_channel.name                  # Channel name to reuse
-    category = old_channel.category          # Parent category to create the new channel under
-    position = old_channel.position          # Position in the channel list to restore afterward
-    overwrites = old_channel.overwrites      # Permission overwrites to carry over
-    topic = old_channel.topic                # Channel topic to carry over
-    nsfw = old_channel.is_nsfw()             # NSFW flag to carry over
-    slowmode = old_channel.slowmode_delay    # Slowmode setting to carry over
+    name = old_channel.name
+    category = old_channel.category          # None if the channel has no parent category
+    guild = old_channel.guild                # Captured before deletion — needed for uncategorised recreate
+    position = old_channel.position
+    overwrites = old_channel.overwrites
+    topic = old_channel.topic
+    nsfw = old_channel.is_nsfw()
+    slowmode = old_channel.slowmode_delay
 
     try:
-        # Delete the old channel — this purges all message history (intentional: clears old bot messages)
         await old_channel.delete(reason="Rebuilding UI channel")
         log("[UI] Deleted old UI channel.")
     except Exception as e:
-        # If deletion fails, abort and return the original ID so the bot state stays consistent
         log(f"[UI] Failed to delete UI channel: {e}")
         return ui_channel_id
 
     try:
-        # Recreate the channel in the same category with all the same settings
-        new_channel = await category.create_text_channel(
-            name=name,
-            overwrites=overwrites,
-            topic=topic,
-            nsfw=nsfw,
-            slowmode_delay=slowmode,
-            reason="Recreating UI channel"
-        )
+        # channel.category is None when the channel sits outside any category.
+        # create_text_channel lives on Category when inside one, or on Guild otherwise.
+        if category is not None:
+            new_channel = await category.create_text_channel(
+                name=name,
+                overwrites=overwrites,
+                topic=topic,
+                nsfw=nsfw,
+                slowmode_delay=slowmode,
+                reason="Recreating UI channel"
+            )
+        else:
+            # No category — create directly on the guild
+            new_channel = await guild.create_text_channel(
+                name=name,
+                overwrites=overwrites,
+                topic=topic,
+                nsfw=nsfw,
+                slowmode_delay=slowmode,
+                reason="Recreating UI channel"
+            )
         log("[UI] Recreated UI channel.")
     except Exception as e:
-        # If creation fails, abort — the old channel is already gone at this point
         log(f"[UI] Failed to recreate UI channel: {e}")
         return ui_channel_id
 
     try:
-        # Restore the channel's original position in the sidebar list
         await new_channel.edit(position=position)
     except Exception as e:
-        # Non-fatal: wrong position is cosmetic, don't abort the whole rebuild
         log(f"[UI] Failed to restore channel position: {e}")
 
-    # Persist the new channel ID in the DB so all future lookups use it
+    # Update DB with new channel ID
     await db.execute(
         "UPDATE settings SET value=? WHERE key='ui_channel_id'",
         (str(new_channel.id),)
     )
     await db.commit()
 
-    # Clear all stale message ID mappings — they referred to the old (now deleted) channel
     await db.execute("DELETE FROM role_ui_messages")
     await db.commit()
 
-    # Fetch only roles that are linked to at least one channel — orphaned roles are excluded
-    async with db.execute("""
-        SELECT DISTINCT r.id, r.name FROM roles r
-        INNER JOIN channel_roles cr ON cr.role_id = r.id
-        ORDER BY r.id
-    """) as cur:
+    async with db.execute("SELECT id, name FROM roles ORDER BY id") as cur:
         rows = await cur.fetchall()
 
-    # Post one message per role and add the subscribe reaction to it
     for role_id, role_name in rows:
         try:
-            # Send the role's UI card into the new channel
-            msg = await new_channel.send(f"**{role_name}**\nReact to subscribe.")
-            # Add the bot's own reaction so users can click it to toggle subscription
-            await msg.add_reaction(ROLE_EMOJI)
-            # Store the message ID so reaction events can be mapped back to this role
+            msg = await new_channel.send(f"**{role_name}**")
+            await msg.add_reaction("✅")
             await db.execute(
                 "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
                 (role_id, msg.id)
             )
             log(f"[UI] Created UI message for role '{role_name}'")
         except Exception as e:
-            # Log failure but continue — partial UI is better than a full crash
             log(f"[UI] Failed to create UI message for role '{role_name}': {e}")
 
-    # Commit all new role_ui_messages rows in one shot
     await db.commit()
     log("[UI] UI rebuild complete.")
 
-    # Return the new channel ID so callers can update their local variable
     return new_channel.id
+
 
 
 @bot.event
@@ -642,7 +636,7 @@ async def on_message(message):
         # Thread or forum post: use the parent channel ID for role lookups
         channel_id = parent.id
 
-    log(f"on_message in channel {message.channel.id} (effective {channel_id}), has_attachments={bool(message.attachments)}")
+   # log(f"on_message in channel {message.channel.id} (effective {channel_id}), has_attachments={bool(message.attachments)}")
 
     # Look up which roles are linked to this effective channel
     async with db.execute(
@@ -650,7 +644,7 @@ async def on_message(message):
     ) as cur:
         rows = await cur.fetchall()
 
-    log(f"Found {len(rows)} role mappings for channel_id {channel_id}")
+    #log(f"Found {len(rows)} role mappings for channel_id {channel_id}")
 
     # Only process if the message has attachments, the channel has linked roles,
     # and the author hasn't suppressed pings with the -nopingy flag
