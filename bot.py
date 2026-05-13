@@ -526,6 +526,7 @@ async def rebuild_ui_slash(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="migrate", description="Migrate all users from Discord roles to DB and delete roles")
+@app_commands.checks.has_permissions(administrator=True)
 async def migrate(interaction: discord.Interaction):
     # Defer ephemerally — this can take a while on large servers
     await interaction.response.defer(ephemeral=True)
