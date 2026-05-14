@@ -6,7 +6,6 @@ import json                             # Used to parse legacy config files (cha
 import os                               # Used to check if files exist before reading them
 import asyncio                          # Needed to run the async main() entry point
 import datetime                         # Used to generate timestamps in log messages
-import time
 
 
 # Absolute path to the SQLite database file
@@ -17,10 +16,12 @@ CONFIG_CHANNELS = "/config/channels.json"
 CONFIG_ROLES = "/config/roles.json"
 # Fallback channel ID used only on the very first run before the DB has a ui_channel_id entry
 ROLE_UI_CHANNEL = int(os.getenv('roles_channel'))
-# The emoji users react with to subscribe/unsubscribe from a role
+# The emoji users click to toggle subscription on a role UI entry
 ROLE_EMOJI = "✅"
 # Path to the flag file written when legacy import fails, signals a fresh DB is needed
 DB_FAIL_FILE = "/config/newDB"
+# Embed color for all role UI entries
+ROLE_UI_EMBED_COLOR = discord.Color.blurple()
 
 # Enable all gateway intents so the bot receives full member, message, and reaction events
 intents = discord.Intents.all()
@@ -194,6 +195,11 @@ async def get_role_id(role_name):
         row = await cur.fetchone()
     return row[0] if row else None
 
+async def get_role_name(role_id):
+    # Look up the role name by internal role ID; returns None if missing
+    async with db.execute("SELECT name FROM roles WHERE id=?", (role_id,)) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
 
 async def get_users_for_role(role_id):
     # Return a list of Discord user IDs subscribed to the given internal role ID
@@ -272,28 +278,57 @@ async def build_role_ui(ui_channel_id):
     await db.execute("DELETE FROM role_ui_messages")
     await db.commit()
 
-    async with db.execute("SELECT id, name FROM roles ORDER BY id") as cur:
+    # Sort roles alphabetically instead of by insertion order so the UI is stable and easier to scan
+    async with db.execute("SELECT id, name FROM roles ORDER BY LOWER(name)") as cur:
         rows = await cur.fetchall()
 
     for role_id, role_name in rows:
         try:
-            time.sleep(0.1)
-            async with db.execute(
-                "SELECT channel_id FROM channel_roles WHERE role_id=?", (role_id,)
-            ) as cur:
-                ch_row = await cur.fetchone()
+            # Do not block the whole bot while spacing out UI message creation
+            await asyncio.sleep(0.1)
 
-            if not ch_row:
-                log(f"[UI] Role '{role_name}' has no linked channel — skipping.")
+            # Fetch all channels linked to this role, not just one
+            async with db.execute(
+                """
+                SELECT channel_id
+                FROM channel_roles
+                WHERE role_id=?
+                ORDER BY channel_id
+                """,
+                (role_id,)
+            ) as cur:
+                ch_rows = await cur.fetchall()
+
+            if not ch_rows:
+                log(f"[UI] Role '{role_name}' has no linked channels — skipping.")
                 continue
 
-            msg = await new_channel.send(f"<#{ch_row[0]}>")
+            # Build a searchable, human-readable list of channel names.
+            # We use the actual channel names as text so Discord search can find them.
+            channel_name_texts = []
+            for (channel_id,) in ch_rows:
+                channel_obj = bot.get_channel(channel_id)
+                if channel_obj:
+                    channel_name_texts.append(f"{channel_obj.name} <#{channel_id}>")
+                else:
+                    # Fallback if the channel no longer exists or is not cached
+                    channel_name_texts.append(f"<#{channel_id}>")
+
+            embed = discord.Embed(
+                title=role_name,
+                description=f"{', '.join(channel_name_texts)}",
+                color=ROLE_UI_EMBED_COLOR
+            )
+
+            msg = await new_channel.send(embed=embed)
             await msg.add_reaction(ROLE_EMOJI)
             await db.execute(
                 "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
                 (role_id, msg.id)
             )
-            log(f"[UI] Created UI message for role '{role_name}' → <#{ch_row[0]}>")
+            log(f"[UI] Created UI message for role '{role_name}' → "
+                f"{', '.join(channel_name_texts)}")
+
         except Exception as e:
             log(f"[UI] Failed to create UI message for role '{role_name}': {e}")
 
@@ -306,62 +341,93 @@ async def build_role_ui(ui_channel_id):
 
 @bot.event
 async def on_raw_reaction_add(payload):
-    # Ignore reactions added by the bot itself (e.g. the initial ✅ it places on each card)
+    # Ignore reactions added by the bot itself
     if payload.user_id == bot.user.id:
         return
-    # Fetch the current UI channel ID from the DB (may have changed since last rebuild)
+
+    # Only process reactions in the current UI channel
     ui_channel_id = await get_ui_channel_id()
-    # Ignore reactions in any channel other than the role UI channel
     if payload.channel_id != ui_channel_id:
         return
-    # Ignore reactions that are not the subscribe emoji
+
+    # Only process the role toggle emoji
     if str(payload.emoji) != ROLE_EMOJI:
         return
 
-    # Look up which role this message corresponds to
+    # Resolve UI message -> role
     async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
+        "SELECT role_id FROM role_ui_messages WHERE message_id=?",
+        (payload.message_id,)
     ) as cur:
         row = await cur.fetchone()
 
-    if row:
-        # Subscribe the user to the role — INSERT OR IGNORE prevents duplicate entries
-        await db.execute(
-            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
-            (payload.user_id, row[0])
-        )
-        await db.commit()
-        role_name = role_row[0] if role_row else str(row[0])
-        log(f"User {payload.user_id} subscribed to '{role_name}'")
-
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    # Fetch the current UI channel ID from the DB
-    ui_channel_id = await get_ui_channel_id()
-    # Ignore reactions removed outside the role UI channel
-    if payload.channel_id != ui_channel_id:
-        return
-    # Ignore removal of any emoji that isn't the subscribe emoji
-    if str(payload.emoji) != ROLE_EMOJI:
+    if not row:
         return
 
-    # Look up which role this message corresponds to
+    role_id = row[0]
+    role_name = await get_role_name(role_id) or str(role_id)
+
+    # Reaction add acts as a toggle:
+    # - if subscribed, unsubscribe
+    # - if not subscribed, subscribe
     async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?", (payload.message_id,)
+        "SELECT 1 FROM user_roles WHERE user_id=? AND role_id=?",
+        (payload.user_id, role_id)
     ) as cur:
-        row = await cur.fetchone()
+        exists = await cur.fetchone()
 
-    if row:
-        # Remove the user's subscription for this role
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except Exception as e:
+            log(f"Failed to fetch UI channel {payload.channel_id}: {e}")
+            return
+
+    if exists:
         await db.execute(
             "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
-            (payload.user_id, row[0])
+            (payload.user_id, role_id)
         )
         await db.commit()
-        log(f"User {payload.user_id} unsubscribed from role_id {row[0]}")
+        log(f"User {payload.user_id} unsubscribed from '{role_name}'")
 
+        await channel.send(
+            f"<@{payload.user_id}> You are unsubscribed from {role_name}",
+            delete_after=10
+        )
+    else:
+        await db.execute(
+            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
+            (payload.user_id, role_id)
+        )
+        await db.commit()
+        log(f"User {payload.user_id} subscribed to '{role_name}'")
+
+        await channel.send(
+            f"<@{payload.user_id}> You are subscribed to {role_name}",
+            delete_after=10
+        )
+
+    # Remove the user's reaction so the UI behaves like a button
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+
+        member = payload.member
+        if member is None and payload.guild_id:
+            guild = bot.get_guild(payload.guild_id)
+            if guild:
+                member = guild.get_member(payload.user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(payload.user_id)
+                    except Exception:
+                        member = None
+
+        if member is not None:
+            await msg.remove_reaction(payload.emoji, member)
+    except Exception as e:
+        log(f"Failed to remove reaction for user {payload.user_id}: {e}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)  # Only admins can add roles
@@ -790,6 +856,13 @@ async def on_message(message):
         if valid:
             log(f"Detected new file in channel {channel_id}: {file_url}")
 
+            # Build the channel label once and repeat it in every batch message so users
+            # always know which channel triggered the ghost ping
+            if parent is not None:
+                channel_label = f"#{parent.name} / {message.channel.name}"
+            else:
+                channel_label = f"#{message.channel.name}"
+
             # For each role linked to this channel, ping its subscribers
             for (role_id,) in rows:
                 users = await get_users_for_role(role_id)
@@ -799,10 +872,11 @@ async def on_message(message):
                 if users:
                     log(f"Pinging {len(users)} users for role_id {role_id} (message {message.id})")
 
-                # Send mentions in batches of 20 to stay within Discord's per-message mention limit
+                # Send mentions in batches of 20 to stay within Discord's per-message mention limit.
+                # Repeat the channel name for every batch message for clarity.
                 for group in chunk(users, 20):
                     mentions = " ".join(f"<@{u}>" for u in group)
-                    msg = await message.channel.send(mentions)
+                    msg = await message.channel.send(f"{channel_label}\n{mentions}")
                     # Delete the ping message after 7 seconds — it only needs to trigger notifications
                     await msg.delete(delay=7)
 
