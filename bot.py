@@ -429,15 +429,6 @@ async def on_raw_reaction_add(payload):
     except Exception as e:
         log(f"Failed to remove reaction for user {payload.user_id}: {e}")
 
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    # Reaction removals are ignored because subscriptions now toggle on reaction add,
-    # and the bot removes user reactions immediately to keep the UI clean.
-    return
-
-
 @bot.command()
 @commands.has_permissions(administrator=True)  # Only admins can add roles
 async def add(ctx, *, role_name):
