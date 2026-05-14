@@ -309,7 +309,7 @@ async def build_role_ui(ui_channel_id):
             for (channel_id,) in ch_rows:
                 channel_obj = bot.get_channel(channel_id)
                 if channel_obj:
-                    channel_name_texts.append(f"#{channel_obj.name} (<#{channel_id}>)")
+                    channel_name_texts.append(f"{channel_obj.name} <#{channel_id}>")
                 else:
                     # Fallback if the channel no longer exists or is not cached
                     channel_name_texts.append(f"<#{channel_id}>")
