@@ -757,8 +757,7 @@ async def migrate(interaction: discord.Interaction):
     with open("dry_run_deletes.log", "w") as f:
         for role in roles_to_delete:
             try:
-                f.write(f"Would delete Discord role: '{role.name}' (id={role.id})\n")
-                log(f"[MIGRATE][DRY RUN] Would delete role '{role.name}' (id={role.id})")
+                await role.delete(reason="Migrated to DB roles")
                 deleted += 1
             except Exception as e:
                 log(f"Failed to log role {role.name}: {e}")
