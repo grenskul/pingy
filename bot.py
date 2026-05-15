@@ -201,6 +201,45 @@ async def get_role_name(role_id):
         row = await cur.fetchone()
     return row[0] if row else None
 
+async def get_role_display_name(role_id):
+    # Prefer a linked channel name without trailing digits, e.g. "books"
+    # over "books2" / "books3". If none exists, fall back to the first
+    # linked channel. If no channels are linked, fall back to the DB role name.
+    async with db.execute(
+        """
+        SELECT channel_id
+        FROM channel_roles
+        WHERE role_id=?
+        ORDER BY channel_id
+        """,
+        (role_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        return await get_role_name(role_id) or str(role_id)
+
+    channel_names = []
+    for (channel_id,) in rows:
+        channel_obj = bot.get_channel(channel_id)
+        if channel_obj is None:
+            try:
+                channel_obj = await bot.fetch_channel(channel_id)
+            except Exception:
+                channel_obj = None
+
+        if channel_obj is not None:
+            channel_names.append(channel_obj.name)
+
+    if not channel_names:
+        return await get_role_name(role_id) or str(role_id)
+
+    for name in channel_names:
+        if not name[-1:].isdigit():
+            return name
+
+    return channel_names[0]
+
 async def get_users_for_role(role_id):
     # Return a list of Discord user IDs subscribed to the given internal role ID
     async with db.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)) as cur:
@@ -279,10 +318,17 @@ async def build_role_ui(ui_channel_id):
     await db.commit()
 
     # Sort roles alphabetically instead of by insertion order so the UI is stable and easier to scan
-    async with db.execute("SELECT id, name FROM roles ORDER BY LOWER(name)") as cur:
+    async with db.execute("SELECT id, name FROM roles") as cur:
         rows = await cur.fetchall()
 
+    role_entries = []
     for role_id, role_name in rows:
+        display_name = await get_role_display_name(role_id)
+        role_entries.append((display_name, role_id, role_name))
+
+    role_entries.sort(key=lambda x: x[0].lower())
+
+    for display_name, role_id, role_name in role_entries:
         try:
             # Do not block the whole bot while spacing out UI message creation
             await asyncio.sleep(0.1)
@@ -315,7 +361,7 @@ async def build_role_ui(ui_channel_id):
                     channel_name_texts.append(f"<#{channel_id}>")
 
             embed = discord.Embed(
-                title=role_name,
+                title=display_name,
                 description=f"{', '.join(channel_name_texts)}",
                 color=ROLE_UI_EMBED_COLOR
             )
@@ -326,7 +372,7 @@ async def build_role_ui(ui_channel_id):
                 "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
                 (role_id, msg.id)
             )
-            log(f"[UI] Created UI message for role '{role_name}' → "
+            log(f"[UI] Created UI message for role '{display_name}' → "
                 f"{', '.join(channel_name_texts)}")
 
         except Exception as e:
@@ -365,7 +411,7 @@ async def on_raw_reaction_add(payload):
         return
 
     role_id = row[0]
-    role_name = await get_role_name(role_id) or str(role_id)
+    role_name = await get_role_display_name(role_id)
 
     # Reaction add acts as a toggle:
     # - if subscribed, unsubscribe
