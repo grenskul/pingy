@@ -16,12 +16,11 @@ CONFIG_CHANNELS = "/config/channels.json"
 CONFIG_ROLES = "/config/roles.json"
 # Fallback channel ID used only on the very first run before the DB has a ui_channel_id entry
 ROLE_UI_CHANNEL = int(os.getenv('roles_channel'))
-# The emoji users click to toggle subscription on a role UI entry
-ROLE_EMOJI = "✅"
 # Path to the flag file written when legacy import fails, signals a fresh DB is needed
 DB_FAIL_FILE = "/config/newDB"
 # Embed color for all role UI entries
 ROLE_UI_EMBED_COLOR = discord.Color.blurple()
+ROLE_UI_CHUNK_SIZE = 10
 
 # Enable all gateway intents so the bot receives full member, message, and reaction events
 intents = discord.Intents.all()
@@ -80,15 +79,6 @@ async def init_db():
         channel_id INTEGER,
         role_id    INTEGER,
         PRIMARY KEY (channel_id, role_id)
-    )
-    ''')
-
-    # role_ui_messages: tracks which Discord message ID corresponds to each role's UI entry
-    # used to map incoming reactions back to the correct role
-    await db.execute('''
-    CREATE TABLE IF NOT EXISTS role_ui_messages (
-        role_id    INTEGER PRIMARY KEY,
-        message_id INTEGER
     )
     ''')
 
@@ -189,23 +179,82 @@ async def import_legacy():
         await write_newdb_flag(f"Unexpected exception: {e}")
 
 
-async def get_role_id(role_name):
-    # Look up the internal role ID by name; returns None if the role doesn't exist
-    async with db.execute("SELECT id FROM roles WHERE name=?", (role_name,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else None
+async def get_role_display_name(role_id):
+    # Prefer a linked channel name without trailing digits, e.g. "books"
+    # over "books2" / "books3". If none exists, fall back to the first
+    # valid linked channel name. If no valid linked channels exist, return None.
+    async with db.execute(
+        """
+        SELECT channel_id
+        FROM channel_roles
+        WHERE role_id=?
+        ORDER BY channel_id
+        """,
+        (role_id,)
+    ) as cur:
+        rows = await cur.fetchall()
 
-async def get_role_name(role_id):
-    # Look up the role name by internal role ID; returns None if missing
-    async with db.execute("SELECT name FROM roles WHERE id=?", (role_id,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else None
+    if not rows:
+        return None
+
+    channel_names = []
+    for (channel_id,) in rows:
+        channel_obj = bot.get_channel(channel_id)
+        if channel_obj is None:
+            try:
+                channel_obj = await bot.fetch_channel(channel_id)
+            except Exception:
+                channel_obj = None
+
+        if channel_obj is not None and getattr(channel_obj, "name", None):
+            channel_names.append(channel_obj.name)
+
+    if not channel_names:
+        return None
+
+    for name in channel_names:
+        if not name[-1:].isdigit():
+            return name
+
+    return channel_names[0]
 
 async def get_users_for_role(role_id):
     # Return a list of Discord user IDs subscribed to the given internal role ID
     async with db.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)) as cur:
         return [r[0] for r in await cur.fetchall()]
 
+async def get_role_channel_objects(role_id):
+    async with db.execute(
+        """
+        SELECT channel_id
+        FROM channel_roles
+        WHERE role_id=?
+        ORDER BY channel_id
+        """,
+        (role_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    channels = []
+    for (channel_id,) in rows:
+        channel_obj = bot.get_channel(channel_id)
+        if channel_obj is None:
+            try:
+                channel_obj = await bot.fetch_channel(channel_id)
+            except Exception:
+                channel_obj = None
+
+        if channel_obj is not None:
+            channels.append(channel_obj)
+
+    return channels
+
+
+async def get_role_channel_link_text(role_id):
+    channels = await get_role_channel_objects(role_id)
+    if not channels:
+        return None
+    return "\n".join(f"<#{channel.id}>" for channel in channels)
 
 def chunk(lst, size=20):
     # Generator that yields successive slices of lst up to `size` elements each
@@ -213,11 +262,81 @@ def chunk(lst, size=20):
     for i in range(0, len(lst), size):
         yield lst[i:i+size]
 
+class RoleToggleButton(discord.ui.Button):
+    def __init__(self, role_id: int):
+        super().__init__(
+            label="Toggle Subscription",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"role_toggle:{role_id}",
+        )
+        self.role_id = role_id
+
+    async def callback(self, interaction: discord.Interaction):
+        role_display_name = await get_role_display_name(self.role_id)
+        if role_display_name is None:
+            role_display_name = "Unknown Author"
+
+        async with db.execute(
+            "SELECT 1 FROM user_roles WHERE user_id=? AND role_id=?",
+            (interaction.user.id, self.role_id),
+        ) as cur:
+            exists = await cur.fetchone()
+
+        if exists:
+            await db.execute(
+                "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
+                (interaction.user.id, self.role_id),
+            )
+            await db.commit()
+            log(f"User {interaction.user.id} unsubscribed from '{role_display_name}'")
+            await interaction.response.send_message(
+                f"You are unsubscribed from {role_display_name}",
+                ephemeral=True,
+            )
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO user_roles(user_id, role_id) "
+                "VALUES(?, ?)",
+                (interaction.user.id, self.role_id),
+            )
+            await db.commit()
+            log(f"User {interaction.user.id} subscribed to '{role_display_name}'")
+            await interaction.response.send_message(
+                f"You are subscribed to {role_display_name}",
+                ephemeral=True,
+            )
+
+
+class RoleContainer(discord.ui.Container):
+    def __init__(self, role_id: int, display_name: str, channel_text: str):
+        text = discord.ui.TextDisplay(
+            f"**{display_name}**\n{channel_text}"
+        )
+        button_row = discord.ui.ActionRow(RoleToggleButton(role_id))
+
+        super().__init__(
+            text,
+            button_row,
+            accent_color=ROLE_UI_EMBED_COLOR,
+        )
+
+
+class RoleLayoutView(discord.ui.LayoutView):
+    def __init__(self, role_entries):
+        super().__init__(timeout=None)
+
+        for role_id, display_name, channel_text in role_entries:
+            self.add_item(RoleContainer(role_id, display_name, channel_text))
 
 async def build_role_ui(ui_channel_id):
-    # Fetch the existing UI channel using the DB value
     old_channel = bot.get_channel(ui_channel_id)
-    if not old_channel:
+    if old_channel is None:
+        try:
+            old_channel = await bot.fetch_channel(ui_channel_id)
+        except Exception:
+            old_channel = None
+
+    if old_channel is None:
         log("[UI] UI channel not found, cannot rebuild.")
         return ui_channel_id
 
@@ -275,159 +394,59 @@ async def build_role_ui(ui_channel_id):
         (str(new_channel.id),)
     )
     await db.commit()
-    await db.execute("DELETE FROM role_ui_messages")
-    await db.commit()
 
-    # Sort roles alphabetically instead of by insertion order so the UI is stable and easier to scan
-    async with db.execute("SELECT id, name FROM roles ORDER BY LOWER(name)") as cur:
+    async with db.execute("SELECT id FROM roles") as cur:
         rows = await cur.fetchall()
 
-    for role_id, role_name in rows:
+    role_entries = []
+    for (role_id,) in rows:
+        display_name = await get_role_display_name(role_id)
+        if display_name is None:
+            log(
+                f"[UI] Skipping role_id {role_id}: "
+                "no valid linked display channel."
+            )
+            continue
+
+        channel_text = await get_role_channel_link_text(role_id)
+        if channel_text is None:
+            log(
+                f"[UI] Skipping '{display_name}' (role_id {role_id}): "
+                "no valid linked channels."
+            )
+            continue
+
+        role_entries.append((display_name, role_id, channel_text))
+
+    role_entries.sort(key=lambda x: x[0].lower())
+
+    total_messages = 0
+    for i in range(0, len(role_entries), ROLE_UI_CHUNK_SIZE):
+        group = role_entries[i : i + ROLE_UI_CHUNK_SIZE]
+        view_entries = [
+            (role_id, display_name, channel_text)
+            for display_name, role_id, channel_text in group
+        ]
+
         try:
-            # Do not block the whole bot while spacing out UI message creation
             await asyncio.sleep(0.1)
+            view = RoleLayoutView(view_entries)
+            await new_channel.send(view=view)
+            total_messages += 1
 
-            # Fetch all channels linked to this role, not just one
-            async with db.execute(
-                """
-                SELECT channel_id
-                FROM channel_roles
-                WHERE role_id=?
-                ORDER BY channel_id
-                """,
-                (role_id,)
-            ) as cur:
-                ch_rows = await cur.fetchall()
-
-            if not ch_rows:
-                log(f"[UI] Role '{role_name}' has no linked channels — skipping.")
-                continue
-
-            # Build a searchable, human-readable list of channel names.
-            # We use the actual channel names as text so Discord search can find them.
-            channel_name_texts = []
-            for (channel_id,) in ch_rows:
-                channel_obj = bot.get_channel(channel_id)
-                if channel_obj:
-                    channel_name_texts.append(f"{channel_obj.name} <#{channel_id}>")
-                else:
-                    # Fallback if the channel no longer exists or is not cached
-                    channel_name_texts.append(f"<#{channel_id}>")
-
-            embed = discord.Embed(
-                title=role_name,
-                description=f"{', '.join(channel_name_texts)}",
-                color=ROLE_UI_EMBED_COLOR
-            )
-
-            msg = await new_channel.send(embed=embed)
-            await msg.add_reaction(ROLE_EMOJI)
-            await db.execute(
-                "INSERT INTO role_ui_messages(role_id, message_id) VALUES(?, ?)",
-                (role_id, msg.id)
-            )
-            log(f"[UI] Created UI message for role '{role_name}' → "
-                f"{', '.join(channel_name_texts)}")
-
+            for display_name, _, _ in group:
+                log(f"[UI] Added UI entry for role '{display_name}'")
+        except ValueError as e:
+            log(f"[UI] Failed to create V2 UI message: {e}")
         except Exception as e:
-            log(f"[UI] Failed to create UI message for role '{role_name}': {e}")
+            log(f"[UI] Failed to send V2 UI message: {e}")
 
-    await db.commit()
-    log("[UI] UI rebuild complete.")
+    log(
+        f"[UI] UI rebuild complete. Posted {len(role_entries)} roles across "
+        f"{total_messages} messages."
+    )
 
     return new_channel.id
-
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-    # Ignore reactions added by the bot itself
-    if payload.user_id == bot.user.id:
-        return
-
-    # Only process reactions in the current UI channel
-    ui_channel_id = await get_ui_channel_id()
-    if payload.channel_id != ui_channel_id:
-        return
-
-    # Only process the role toggle emoji
-    if str(payload.emoji) != ROLE_EMOJI:
-        return
-
-    # Resolve UI message -> role
-    async with db.execute(
-        "SELECT role_id FROM role_ui_messages WHERE message_id=?",
-        (payload.message_id,)
-    ) as cur:
-        row = await cur.fetchone()
-
-    if not row:
-        return
-
-    role_id = row[0]
-    role_name = await get_role_name(role_id) or str(role_id)
-
-    # Reaction add acts as a toggle:
-    # - if subscribed, unsubscribe
-    # - if not subscribed, subscribe
-    async with db.execute(
-        "SELECT 1 FROM user_roles WHERE user_id=? AND role_id=?",
-        (payload.user_id, role_id)
-    ) as cur:
-        exists = await cur.fetchone()
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(payload.channel_id)
-        except Exception as e:
-            log(f"Failed to fetch UI channel {payload.channel_id}: {e}")
-            return
-
-    if exists:
-        await db.execute(
-            "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
-            (payload.user_id, role_id)
-        )
-        await db.commit()
-        log(f"User {payload.user_id} unsubscribed from '{role_name}'")
-
-        await channel.send(
-            f"<@{payload.user_id}> You are unsubscribed from {role_name}",
-            delete_after=10
-        )
-    else:
-        await db.execute(
-            "INSERT OR IGNORE INTO user_roles(user_id, role_id) VALUES(?, ?)",
-            (payload.user_id, role_id)
-        )
-        await db.commit()
-        log(f"User {payload.user_id} subscribed to '{role_name}'")
-
-        await channel.send(
-            f"<@{payload.user_id}> You are subscribed to {role_name}",
-            delete_after=10
-        )
-
-    # Remove the user's reaction so the UI behaves like a button
-    try:
-        msg = await channel.fetch_message(payload.message_id)
-
-        member = payload.member
-        if member is None and payload.guild_id:
-            guild = bot.get_guild(payload.guild_id)
-            if guild:
-                member = guild.get_member(payload.user_id)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(payload.user_id)
-                    except Exception:
-                        member = None
-
-        if member is not None:
-            await msg.remove_reaction(payload.emoji, member)
-    except Exception as e:
-        log(f"Failed to remove reaction for user {payload.user_id}: {e}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)  # Only admins can add roles
@@ -455,142 +474,211 @@ async def add(ctx, *, role_name):
 
 @bot.command()
 async def ucheck(ctx, member: discord.Member):
-    # Query all roles the given member is subscribed to, sorted alphabetically
     async with db.execute(
         """
-        SELECT r.name FROM user_roles ur
-        JOIN roles r ON r.id = ur.role_id
-        WHERE ur.user_id = ?
-        ORDER BY r.name
+        SELECT role_id
+        FROM user_roles
+        WHERE user_id = ?
+        ORDER BY role_id
         """,
-        (member.id,)
+        (member.id,),
     ) as cur:
         rows = await cur.fetchall()
 
     if not rows:
-        # Member has no subscriptions
         await ctx.send(f"{member.display_name} has no roles.")
         log(f"ucheck: {member.id} has no roles.")
         return
 
-    # Format the list of role names as a bulleted list
-    role_list = "\n".join(f"• {r[0]}" for r in rows)
-    log(f"ucheck: {member.id} has roles: {role_list}")
-    # Send the result publicly in the channel where the command was used
+    display_names = []
+    for (role_id,) in rows:
+        display_name = await get_role_display_name(role_id)
+        if display_name is None:
+            log(
+                f"ucheck: role_id {role_id} for user {member.id} has no "
+                "valid display channel."
+            )
+            display_name = f"Unknown Author ({role_id})"
+        display_names.append(display_name)
+
+    display_names.sort(key=str.lower)
+    role_list = "\n".join(f"• {name}" for name in display_names)
+
+    log(f"ucheck: {member.id} has roles: {', '.join(display_names)}")
     await ctx.send(f"**{member.display_name}** is subscribed to:\n{role_list}")
 
-
-
 @bot.command()
-async def rcheck(ctx, *, role_name: str):
-    # Look up the role by name — role names may contain spaces so we use *
-    role_id = await get_role_id(role_name)
-    if not role_id:
-        await ctx.send(f"Role \"{role_name}\" not found.")
-        log(f"rcheck: role \"{role_name}\" not found.")
-        return
-
-    # Fetch all user IDs subscribed to this role
+async def rcheck(ctx, channel: discord.TextChannel):
     async with db.execute(
         """
-        SELECT ur.user_id FROM user_roles ur
-        WHERE ur.role_id = ?
+        SELECT role_id
+        FROM channel_roles
+        WHERE channel_id = ?
+        ORDER BY role_id
         """,
-        (role_id,)
+        (channel.id,),
     ) as cur:
         rows = await cur.fetchall()
 
     if not rows:
-        await ctx.send(f"No users are subscribed to **{role_name}**.")
-        log(f"rcheck: no users for role \"{role_name}\".")
+        await ctx.send(f"No role is linked to {channel.mention}.")
+        log(f"rcheck: no role linked to channel {channel.id}.")
         return
 
-    # Resolve user IDs to display names — fall back to raw ID if the member isn't cached
     guild = ctx.guild
-    names = []
-    for (user_id,) in rows:
-        member = guild.get_member(user_id)
-        names.append(member.display_name if member else str(user_id))
+    sections = []
 
-    names.sort()
-    log(f"rcheck: role \"{role_name}\" has {len(names)} subscribers.")
+    for (role_id,) in rows:
+        display_name = await get_role_display_name(role_id)
+        if display_name is None:
+            display_name = f"Unknown Author ({role_id})"
+            log(
+                f"rcheck: role_id {role_id} linked to channel {channel.id} has "
+                "no valid display channel."
+            )
 
-    # Discord messages cap at 2000 characters — chunk the list if it's long
-    header = f"**{role_name}** — {len(names)} subscriber(s):\n"
-    lines = [f"• {n}" for n in names]
-    message = header + "\n".join(lines)
+        async with db.execute(
+            """
+            SELECT user_id
+            FROM user_roles
+            WHERE role_id = ?
+            """,
+            (role_id,),
+        ) as cur:
+            user_rows = await cur.fetchall()
+
+        if not user_rows:
+            log(f'rcheck: no users for role "{display_name}".')
+            sections.append(
+                f"**{display_name}** — 0 subscriber(s):\n• No users subscribed"
+            )
+            continue
+
+        names = []
+        for (user_id,) in user_rows:
+            member = guild.get_member(user_id)
+            names.append(member.display_name if member else str(user_id))
+
+        names.sort()
+        log(f'rcheck: role "{display_name}" has {len(names)} subscribers.')
+
+        section = (
+            f"**{display_name}** — {len(names)} subscriber(s):\n"
+            + "\n".join(f"• {n}" for n in names)
+        )
+        sections.append(section)
+
+    message = "\n\n".join(sections)
 
     if len(message) <= 2000:
         await ctx.send(message)
     else:
-        # Send header first, then batches of lines that fit within the limit
-        await ctx.send(header.strip())
         batch = ""
-        for line in lines:
-            if len(batch) + len(line) + 1 > 2000:
-                await ctx.send(batch.strip())
-                batch = ""
-            batch += line + "\n"
+        for section in sections:
+            addition = section + "\n\n"
+            if len(batch) + len(addition) > 2000:
+                if batch:
+                    await ctx.send(batch.strip())
+                batch = addition
+            else:
+                batch += addition
+
         if batch:
             await ctx.send(batch.strip())
 
 
-@bot.tree.command(name="rcheck", description="List all users subscribed to a role")
-async def slash_rcheck(interaction: discord.Interaction, role_name: str):
-    # Defer publicly so the result is visible to everyone in the channel
+@bot.tree.command(name="rcheck", description="List all users subscribed to a channel")
+async def slash_rcheck(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
     await interaction.response.defer(ephemeral=False)
 
-    # Look up the role by name
-    role_id = await get_role_id(role_name)
-    if not role_id:
-        await interaction.followup.send(f"Role \"{role_name}\" not found.")
-        log(f"[SLASH] rcheck: role \"{role_name}\" not found.")
-        return
-
-    # Fetch all user IDs subscribed to this role
     async with db.execute(
         """
-        SELECT ur.user_id FROM user_roles ur
-        WHERE ur.role_id = ?
+        SELECT role_id
+        FROM channel_roles
+        WHERE channel_id = ?
+        ORDER BY role_id
         """,
-        (role_id,)
+        (channel.id,),
     ) as cur:
         rows = await cur.fetchall()
 
     if not rows:
-        await interaction.followup.send(f"No users are subscribed to **{role_name}**.")
-        log(f"[SLASH] rcheck: no users for role \"{role_name}\".")
+        await interaction.followup.send(
+            f"No role is linked to {channel.mention}."
+        )
+        log(f"[SLASH] rcheck: no role linked to channel {channel.id}.")
         return
 
-    # Resolve user IDs to display names — fall back to raw ID if the member isn't cached
     guild = interaction.guild
-    names = []
-    for (user_id,) in rows:
-        member = guild.get_member(user_id)
-        names.append(member.display_name if member else str(user_id))
+    sections = []
 
-    names.sort()
-    log(f"[SLASH] rcheck: role \"{role_name}\" has {len(names)} subscribers.")
+    for (role_id,) in rows:
+        display_name = await get_role_display_name(role_id)
+        if display_name is None:
+            display_name = f"Unknown Author ({role_id})"
+            log(
+                f"[SLASH] rcheck: role_id {role_id} linked to channel {channel.id} has no valid display channel."
+            )
 
-    # Build the response and chunk it if it exceeds Discord's 2000-character limit
-    header = f"**{role_name}** — {len(names)} subscriber(s):\n"
-    lines = [f"• {n}" for n in names]
-    message = header + "\n".join(lines)
+        async with db.execute(
+            """
+            SELECT user_id
+            FROM user_roles
+            WHERE role_id = ?
+            """,
+            (role_id,),
+        ) as cur:
+            user_rows = await cur.fetchall()
+
+        if not user_rows:
+            log(f'[SLASH] rcheck: no users for role "{display_name}".')
+            sections.append(
+                f"**{display_name}** — 0 subscriber(s):\n• No users subscribed"
+            )
+            continue
+
+        names = []
+        for (user_id,) in user_rows:
+            member = guild.get_member(user_id)
+            names.append(member.display_name if member else str(user_id))
+
+        names.sort()
+        log(f'[SLASH] rcheck: role "{display_name}" has {len(names)} subscribers.')
+
+        section = (
+            f"**{display_name}** — {len(names)} subscriber(s):\n"
+            + "\n".join(f"• {n}" for n in names)
+        )
+        sections.append(section)
+
+    message = "\n\n".join(sections)
 
     if len(message) <= 2000:
         await interaction.followup.send(message)
     else:
-        await interaction.followup.send(header.strip())
+        first = True
         batch = ""
-        for line in lines:
-            if len(batch) + len(line) + 1 > 2000:
-                await interaction.channel.send(batch.strip())
-                batch = ""
-            batch += line + "\n"
+
+        for section in sections:
+            addition = section + "\n\n"
+            if len(batch) + len(addition) > 2000:
+                if first:
+                    await interaction.followup.send(batch.strip())
+                    first = False
+                else:
+                    await interaction.channel.send(batch.strip())
+                batch = addition
+            else:
+                batch += addition
+
         if batch:
-            await interaction.channel.send(batch.strip())
-
-
+            if first:
+                await interaction.followup.send(batch.strip())
+            else:
+                await interaction.channel.send(batch.strip())
 
 
 @bot.tree.command(name="add", description="Link a role to the current channel")
@@ -629,36 +717,12 @@ async def hard_delete_role(role_name: str):
 
     role_id = row[0]
 
-    # Check if this role has an active UI message in the role channel
-    async with db.execute("SELECT message_id FROM role_ui_messages WHERE role_id=?", (role_id,)) as cur:
-        ui_row = await cur.fetchone()
-
-    if ui_row:
-        message_id = ui_row[0]
-        # Get the current UI channel object from the bot cache
-        ui_channel_id = await get_ui_channel_id()
-        channel = bot.get_channel(ui_channel_id)
-        if channel:
-            try:
-                # Fetch and delete the specific UI message for this role
-                msg = await channel.fetch_message(message_id)
-                await msg.delete()
-                log(f"[DELETE_ROLE] Deleted UI message for role '{role_name}'")
-            except Exception as e:
-                # Non-fatal: message may already be gone (e.g. after a UI rebuild)
-                log(f"[DELETE_ROLE] Failed to delete UI message for role '{role_name}': {e}")
-
-    # Remove all user subscriptions for this role
     await db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
-    # Remove all channel links for this role
     await db.execute("DELETE FROM channel_roles WHERE role_id=?", (role_id,))
-    # Remove the UI message mapping for this role
-    await db.execute("DELETE FROM role_ui_messages WHERE role_id=?", (role_id,))
-    # Remove the role itself from the roles table
     await db.execute("DELETE FROM roles WHERE id=?", (role_id,))
     await db.commit()
 
-    log(f"[DELETE_ROLE] Fully deleted role '{role_name}' (role_id {role_id}) from DB")
+    log(f"[DELETE_ROLE] Fully deleted role '{role_name}' (role_id {role_id})")
     return True, f"Role '{role_name}' fully deleted from DB."
 
 
@@ -777,10 +841,10 @@ async def slash_ucheck(interaction: discord.Interaction, member: discord.Member)
     # Query all roles the given member is subscribed to, sorted alphabetically
     async with db.execute(
         """
-        SELECT r.name FROM user_roles ur
-        JOIN roles r ON r.id = ur.role_id
-        WHERE ur.user_id = ?
-        ORDER BY r.name
+        SELECT role_id
+        FROM user_roles
+        WHERE user_id = ?
+        ORDER BY role_id
         """,
         (member.id,)
     ) as cur:
@@ -791,9 +855,21 @@ async def slash_ucheck(interaction: discord.Interaction, member: discord.Member)
         await interaction.followup.send(f"{member.display_name} has no roles.", ephemeral=True)
         return
 
-    # Format the list of role names as a bulleted list
-    role_list = "\n".join(f"• {r[0]}" for r in rows)
-    log(f"[SLASH] ucheck: {member.id} has roles: {role_list}")
+    display_names = []
+    for (role_id,) in rows:
+        display_name = await get_role_display_name(role_id)
+        if display_name is None:
+            log(
+                f"[SLASH] ucheck: role_id {role_id} for user {member.id} has "
+                "no valid display channel."
+            )
+            display_name = f"Unknown Author ({role_id})"
+        display_names.append(display_name)
+
+    display_names.sort(key=str.lower)
+    role_list = "\n".join(f"• {name}" for name in display_names)
+
+    log(f"[SLASH] ucheck: {member.id} has roles: {', '.join(display_names)}")
     await interaction.followup.send(
         f"**{member.display_name}** is subscribed to:\n{role_list}",
         ephemeral=True
@@ -813,11 +889,16 @@ async def on_app_command_error(interaction, error):
     # Catch missing-permission errors for slash commands and respond ephemerally
     if isinstance(error, app_commands.MissingPermissions):
         log(f"[SLASH] Permission denied for user {interaction.user.id} on slash command.")
-        await interaction.response.send_message(
-            "You must be an administrator to use this command.",
-            ephemeral=True
-        )
-
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "You must be an administrator to use this command.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "You must be an administrator to use this command.",
+                ephemeral=True,
+            )
 
 @bot.event
 async def on_message(message):
